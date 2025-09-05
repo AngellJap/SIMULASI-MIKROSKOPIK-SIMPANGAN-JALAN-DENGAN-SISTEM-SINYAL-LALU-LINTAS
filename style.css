@@ -36,8 +36,24 @@ h1 {
 }
 
 canvas {
-  background-color: #696969; /* DimGray for road */
+  background-color: #ffffff; /* DimGray for road */
   border: 2px solid white;
   display: block;
   margin: 0 auto;
+}
+
+.controls-container {
+  display: flex;
+  gap: 20px;          /* jarak antar panel */
+  align-items: flex-start; /* rata atas */
+  justify-content: center;
+}
+
+.panel {
+  flex: 1;
+  font-family: sans-serif;
+  padding: 10px;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.1);
 }
