@@ -35,6 +35,46 @@
     </div>
   </div>
 
+<div class="controls-container">
+  <!-- Panel Radius Minimum -->
+  <div class="panel">
+  <h2>Radius Minimum</h2>
+
+  <label for="customRange">Batas Ukuran dalam meter (3.28 – 11.59) :</label>
+  <input id="customRange" type="range" min="3.28" max="11.59" step="0.01" value="3.28">
+  <span id="rangeVal">3.28</span> meter
+</div>
+
+  <!-- Panel Durasi Lampu -->
+  <div class="panel">
+    <h2>Pengaturan Durasi Lampu (detik)</h2>
+    <label>Merah: </label>
+    <input id="durRed" type="number" value="5" min="1"> detik
+    <br>
+    <label>Kuning: </label>
+    <input id="durYellow" type="number" value="2" min="1"> detik
+    <br>
+    <label>Hijau: </label>
+    <input id="durGreen" type="number" value="5" min="1"> detik
+  </div>
+</div>
+
+
+<script>
+  // tampilkan nilai slider saat digeser
+  const slider = document.getElementById("customRange");
+  const output = document.getElementById("rangeVal");
+
+  const update = () => output.textContent = slider.value;
+  slider.addEventListener("input", update);
+  update(); // inisialisasi nilai awal
+</script>
+
+<style>
+  .panel { font-family: sans-serif; max-width: 420px }
+  input[type="range"] { width: 100% }
+</style>
+
   <canvas id="simCanvas" width="800" height="800"></canvas>
 
   <script type="module" src="js/main.js"></script>
