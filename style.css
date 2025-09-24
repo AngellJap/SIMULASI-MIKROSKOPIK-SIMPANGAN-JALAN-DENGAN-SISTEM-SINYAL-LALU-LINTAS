@@ -35,13 +35,6 @@ h1 {
   border-radius: 8px;
 }
 
-canvas {
-  background-color: #ffffff; /* DimGray for road */
-  border: 2px solid white;
-  display: block;
-  margin: 0 auto;
-}
-
 .controls-container {
   display: flex;
   gap: 20px;          /* jarak antar panel */
@@ -74,4 +67,34 @@ canvas {
   width: 70px;
   text-align: right;
   margin-right: 10px;
+}
+
+/* ====== Canvas Styling ====== */
+.canvas-container {
+  position: relative;
+  width: 800px;
+  height: 800px;
+  margin: 0 auto;
+}
+
+/* Canvas utama untuk jalan */
+#simCanvas {
+  background-color: #ffffff; /* warna jalan */
+  border: 2px solid white;
+  display: block;
+  margin: 0 auto;
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 0;
+}
+
+/* Canvas overlay untuk kendaraan (transparan) */
+#vehicleCanvas {
+  background-color: transparent; /* transparan */
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  pointer-events: none; /* klik tetap kena ke simCanvas */
 }
