@@ -34,7 +34,6 @@
       </div>
     </div>
   </div>
-
 <div class="controls-container">
   <!-- Panel Radius Minimum -->
   <div class="panel">
@@ -58,11 +57,43 @@
   </div>
 </div>
 
+<!--Panel Pengaturan Lalu Lintas-->
+  <div class="panel traffic-panel">
+    <h2>Pengaturan Arus Lalu Lintas</h2>
+    <div class="row mt-3">
+      <div class="col">
+        <label for="directionSelect" class="form-label">Lengan</label>
+        <select class="form-select" id="directionSelect"></select>
+              <option value="utara">Utara</option>
+              <option value="timur">Timur</option>
+              <option value="selatan">Selatan</option>
+              <option value="barat">Barat</option>
+        </select>
+      </div>
+    </div>
+    <div class="row mt-3">
+       <div class="col">
+           <label for="trafficFlowSlider" class="form-label">
+               Arus Lalu Lintas: <span id="flowValue">500 smp/jam</span>
+           </label>
+           <input type="range" class="form-range" id="trafficFlowSlider" min="100" max="1000" step="100" value="500">
+       </div>
+     </div>
+        <div class="row mt-3">
+            <div class="col">
+                <label for="truckPercentageSlider" class="form-label">
+                    Persentase Truk: <span id="truckPercentageValue">20%</span>
+                </label>
+                <input type="range" class="form-range" id="truckPercentageSlider" min="0" max="100" step="1" value="20">
+            </div>
+        </div>
+    </div>
+  </div>
+  
 <script>
   // tampilkan nilai slider saat digeser
   const slider = document.getElementById("customRange");
   const output = document.getElementById("rangeVal");
-
   const update = () => output.textContent = slider.value;
   slider.addEventListener("input", update);
   update(); // inisialisasi nilai awal
@@ -73,11 +104,16 @@
   input[type="range"] { width: 100% }
 </style>
 
+  <!--Container untuk 2 canvas (layer)-->  
+<div class="canvas-container">
   <canvas id="simCanvas" width="800" height="800"></canvas>
+  <canvas id="vehicleCanvas" width="800" height="800"></canvas>
+</div>
 
   <script type="module" src="js/main.js"></script>
 </body>
 </html>
+
 
 
 
