@@ -1,168 +1,169 @@
 /**
- * Kelas untuk mengelola lampu lalu lintas, memastikan posisinya dinamis
- * berdasarkan konfigurasi jumlah lajur dan radius putaran.
+ * LampuLaluLintas.js
+ * Mengelola siklus dan status lampu lalu lintas, serta menggambar visualnya.
  */
 export class LampuLaluLintas {
-  constructor(canvasId) {
-    this.canvas = document.getElementById(canvasId);
-    this.ctx = this.canvas.getContext("2d");
+    constructor(canvasId) {
+        this.canvas = document.getElementById(canvasId);
+        this.ctx = this.canvas.getContext("2d");
 
-    // muat gambar lampu
-    this.gambar = {
-      merah: new Image(),
-      kuning: new Image(),
-      hijau: new Image()
-    };
-    this.gambar.merah.src = "js/Lampu_Lalu_Lintas/merah.png";
-    this.gambar.kuning.src = "js/Lampu_Lalu_Lintas/kuning.png";
-    this.gambar.hijau.src = "js/Lampu_Lalu_Lintas/hijau.png";
+        // Muat gambar lampu
+        this.gambar = {
+            merah: new Image(),
+            kuning: new Image(),
+            hijau: new Image()
+        };
+        this.gambar.merah.src = "js/Lampu_Lalu_Lintas/merah.png";
+        this.gambar.kuning.src = "js/Lampu_Lalu_Lintas/kuning.png";
+        this.gambar.hijau.src = "js/Lampu_Lalu_Lintas/hijau.png";
 
-    // rotasi lampu di tiap lengan (dalam radian)
-    this.rotasiLampu = {
-      utara: 270 * Math.PI / 180,
-      timur: 0 * Math.PI / 180,
-      selatan: 90 * Math.PI / 180,
-      barat: 180 * Math.PI / 180
-    };
+        // Rotasi lampu tiap lengan (radian)
+        this.rotasiLampu = {
+            utara: 270 * Math.PI / 180,
+            timur: 0,
+            selatan: 90 * Math.PI / 180,
+            barat: Math.PI
+        };
 
-    // urutan siklus searah jarum jam
-    this.urutan = ["utara", "timur", "selatan", "barat"];
-    this.indexAktif = 0; // mulai dari Utara
+        this.urutan = ["utara", "timur", "selatan", "barat"];
+        this.indexAktif = 0;
 
-    // status lampu default = semua merah
-    this.status = {
-      utara: "merah",
-      timur: "merah",
-      selatan: "merah",
-      barat: "merah"
-    };
+        // Status warna lampu
+        this.status = { utara: "merah", timur: "merah", selatan: "merah", barat: "merah" };
+        this.posLampu = { utara: {}, timur: {}, selatan: {}, barat: {} };
 
-    // Bind this ke metode updatePosition agar bisa dipanggil dari main.js
-    this.updatePosition = this.updatePosition.bind(this);
-
-    // Variabel untuk menyimpan posisi lampu
-    this.posLampu = {};
-  }
-
-  /**
-   * Mengambil konfigurasi dari main.js untuk menghitung posisi lampu lalu lintas.
-   * Posisi dihitung dari "titik merah" (sudut dalam persimpangan) yang disesuaikan.
-   * @param {object} config - Objek konfigurasi persimpangan dari main.js.
-   */
-  updatePosition(config) {
-    const skala = config.skala_px * 3;
-    const centerX = this.canvas.width / 2;
-    const centerY = this.canvas.height / 2;
-
-    // Ambil nilai radius dari slider
-    const radiusSlider = document.getElementById("customRange");
-    const radiusValue = parseFloat(radiusSlider.value);
-    
-    // Konversi nilai slider dari meter ke piksel
-    const pixelsPerMeter = skala / 3; // Menggunakan 3 agar sinkron dengan drawTurningRadius
-    const squareSideLength = radiusValue * pixelsPerMeter;
-
-    // Menghitung posisi berdasarkan jumlah lajur masuk dan keluar
-    const Uin_px = config.utara.in * skala;
-    const Uout_px = config.utara.out * skala;
-    const Sin_px = config.selatan.in * skala;
-    const Sout_px = config.selatan.out * skala;
-    const Tin_px = config.timur.in * skala;
-    const Tout_px = config.timur.out * skala;
-    const Bin_px = config.barat.in * skala;
-    const Bout_px = config.barat.out * skala;
-
-    // Perhitungan posisi lampu yang telah dimodifikasi
-    // Posisi lampu utara dan selatan (vertikal)
-    this.posLampu.utara = { 
-        x: centerX + Uin_px + 30, // Posisi X tetap, hanya bergantung pada lajur
-        y: centerY - Tout_px - squareSideLength - 0 // Posisi Y berubah dengan slider
-    };
-    
-    this.posLampu.selatan = { 
-        x: centerX - Sin_px - 30, // Posisi X tetap, hanya bergantung pada lajur
-        y: centerY + Bout_px + squareSideLength + 0 // Posisi Y berubah dengan slider
-    };
-    
-    // Posisi lampu timur dan barat (horizontal)
-    this.posLampu.timur = { 
-        x: centerX + Sout_px + squareSideLength + 0, // Posisi X berubah dengan slider
-        y: centerY + Tin_px + 30 // Posisi Y tetap, hanya bergantung pada lajur
-    };
-    
-    this.posLampu.barat = { 
-        x: centerX - Uout_px - squareSideLength - 0, // Posisi X berubah dengan slider
-        y: centerY - Bin_px - 30 // Posisi Y tetap, hanya bergantung pada lajur
-    };
-  }
-
-  // ambil durasi dari input HTML
-getDurasi() {
-  return {
-    hijau: parseInt(document.getElementById("durGreen").value) * 1000,
-    kuning: parseInt(document.getElementById("durYellow").value) * 1000,
-    allRed: parseInt(document.getElementById("durAllRed").value) * 1000
-  };
-}
-
-  // gambar lampu di semua lengan
-  draw() {
-    const ctx = this.ctx;
-    
-    // Gambar jalan digambar di file main.js, jadi kita tidak perlu menghapusnya di sini.
-
-    for (let arah in this.posLampu) {
-      const warna = this.status[arah];
-      const pos = this.posLampu[arah];
-      const rotasi = this.rotasiLampu[arah];
-
-      ctx.save();
-      // geser titik rotasi ke tengah lampu
-      ctx.translate(pos.x, pos.y);
-      ctx.rotate(rotasi);
-      // gambar lampu diputar
-      ctx.drawImage(this.gambar[warna], -30, -30, 60, 60);
-      ctx.restore();
+        // Fase & durasi
+        this.fase = "allRed";
+        this.waktuFase = 0;
+        this.durasi = this.getDurasi();
     }
 
-    requestAnimationFrame(() => this.draw());
-  }
+    /** Hitung posisi lampu berdasarkan arah dan lajur */
+    _calculatePos(arah, inVal, outVal, laneWidth, radius_px, margin, centerX, centerY) {
+        let x = 0, y = 0;
+        switch (arah) {
+            case "utara":
+                x = centerX + (inVal - 1) * laneWidth + 60;
+                y = centerY - radius_px - margin - laneWidth / 2 - outVal * laneWidth;
+                break;
+            case "selatan":
+                x = centerX - (inVal - 1) * laneWidth - 60;
+                y = centerY + radius_px + margin + laneWidth / 2 + outVal * laneWidth;
+                break;
+            case "timur":
+                y = centerY + (inVal - 1) * laneWidth + 60;
+                x = centerX + radius_px + margin + laneWidth / 2 + outVal * laneWidth;
+                break;
+            case "barat":
+                y = centerY - (inVal - 1) * laneWidth - 60;
+                x = centerX - radius_px - margin - laneWidth / 2 - outVal * laneWidth;
+                break;
+        }
+        return { x, y };
+    }
 
-// update siklus
-update() {
-  const durasi = this.getDurasi();
-  const arahAktif = this.urutan[this.indexAktif];
+    /** Update posisi lampu */
+    updatePosition(config) {
+        if (!config) return;
+        const skala = (config.skala_px || 10) * 3;
+        const centerX = this.canvas.width / 2;
+        const centerY = this.canvas.height / 2;
+        const radiusValue = (typeof config.radiusValue === "number") ? config.radiusValue : (parseFloat(config.radiusValue) || 5);
+        const pixelsPerMeter = skala / 3;
+        const radius_px = radiusValue * pixelsPerMeter;
+        const laneWidth = Math.max(30, Math.round(skala / 1.5));
+        const margin = Math.round(laneWidth * 0.5) - 30;
 
-  // reset semua merah di awal (instant, tidak pakai allRed)
-  for (let arah of this.urutan) {
-    this.status[arah] = "merah";
-  }
+        this.posLampu.utara = this._calculatePos("utara", config.utara?.in || 2, config.timur?.out || 0, laneWidth, radius_px, margin, centerX, centerY);
+        this.posLampu.selatan = this._calculatePos("selatan", config.selatan?.in || 2, config.barat?.out || 0, laneWidth, radius_px, margin, centerX, centerY);
+        this.posLampu.timur = this._calculatePos("timur", config.timur?.in || 2, config.selatan?.out || 0, laneWidth, radius_px, margin, centerX, centerY);
+        this.posLampu.barat = this._calculatePos("barat", config.barat?.in || 2, config.utara?.out || 0, laneWidth, radius_px, margin, centerX, centerY);
+    }
 
-  // fase hijau
-  this.status[arahAktif] = "hijau";
-  setTimeout(() => {
-    // fase kuning
-    this.status[arahAktif] = "kuning";
-    setTimeout(() => {
-      // fase all-red setelah kuning
-      for (let arah of this.urutan) {
-        this.status[arah] = "merah";
-      }
-      setTimeout(() => {
-        // ganti ke arah berikutnya
-        this.indexAktif = (this.indexAktif + 1) % this.urutan.length;
-        this.update();
-      }, durasi.allRed);
+    /** Ambil durasi dari input UI */
+    getDurasi() {
+        const safeParse = (id, fallback) => {
+            const el = document.getElementById(id);
+            if (!el) return fallback;
+            const v = parseInt(el.value);
+            return Number.isFinite(v) ? v * 1000 : fallback;
+        };
+        return {
+            hijau: safeParse("durGreen", 5000),
+            kuning: safeParse("durYellow", 1000),
+            allRed: safeParse("durAllRed", 500)
+        };
+    }
 
-    }, durasi.kuning);
+    /** Update durasi manual (opsional) */
+    updateDurations() {
+        this.durasi = this.getDurasi();
+    }
 
-  }, durasi.hijau);
-}
+    /** Gambar lampu */
+    draw() {
+        const ctx = this.ctx;
+        const lampSize = 60;
+        const half = lampSize / 2;
+        for (let arah of this.urutan) {
+            const warna = this.status[arah] || "merah";
+            const pos = this.posLampu[arah] || { x: 0, y: 0 };
+            const rotasi = this.rotasiLampu[arah] || 0;
 
-  start() {
-    this.gambar.hijau.onload = () => {
-      this.draw();
-      this.update();
-    };
-  }
+            ctx.save();
+            ctx.translate(pos.x, pos.y);
+            ctx.rotate(rotasi);
+
+            const img = this.gambar[warna];
+            if (img && img.complete && img.naturalWidth !== 0) {
+                ctx.drawImage(img, -half, -half, lampSize, lampSize);
+            } else {
+                ctx.fillStyle = warna === "merah" ? "#b22" : warna === "kuning" ? "#eea" : "#2b2";
+                ctx.fillRect(-half, -half, lampSize, lampSize);
+                ctx.strokeStyle = "#333";
+                ctx.strokeRect(-half, -half, lampSize, lampSize);
+            }
+
+            ctx.restore();
+        }
+    }
+
+    /** Jalankan siklus lampu */
+    tick(deltaTime) {
+        // 🚩 sekarang selalu ambil durasi terbaru dari UI
+        this.durasi = this.getDurasi();
+
+        this.waktuFase += deltaTime;
+        const arahAktif = this.urutan[this.indexAktif];
+
+        switch (this.fase) {
+            case "allRed":
+                for (let arah of this.urutan) this.status[arah] = "merah";
+                if (this.waktuFase >= this.durasi.allRed) {
+                    this.fase = "hijau";
+                    this.waktuFase = 0;
+                    this.status[arahAktif] = "hijau";
+                }
+                break;
+
+            case "hijau":
+                this.status[arahAktif] = "hijau";
+                if (this.waktuFase >= this.durasi.hijau) {
+                    this.fase = "kuning";
+                    this.waktuFase = 0;
+                    this.status[arahAktif] = "kuning";
+                }
+                break;
+
+            case "kuning":
+                this.status[arahAktif] = "kuning";
+                if (this.waktuFase >= this.durasi.kuning) {
+                    this.fase = "allRed";
+                    this.waktuFase = 0;
+                    for (let arah of this.urutan) this.status[arah] = "merah";
+                    this.indexAktif = (this.indexAktif + 1) % this.urutan.length;
+                }
+                break;
+        }
+    }
 }
