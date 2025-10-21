@@ -1,4 +1,14 @@
 // vehmov.js (dua-titik axle model: rear & front mengikuti path — truk seperti gerbong)
+// REVISI: Perbaikan sinkronisasi poros depan/belakang agar titik putih tidak "nge-jerk"
+// + Laser depan: simpan koordinat laser di v._laser dan gambar garis hijau di debug
+// Skala asumsi: 10 px == 1 m (PX_PER_M = 10)
+// Perubahan utama:
+// - Tambah helper updateAxlesFromCenter() dan panggil di semua tempat yang memindahkan v.x/v.y
+// - computeDebugBoxForVehicle menyertakan debugBox.front & debugBox.rear
+// - drawDebugPoints sekarang menampilkan titik biru di setiap corner debugBox untuk verifikasi
+// - TAMBAH: perimeterSamples & centerlineSamples disimpan di v.debugBox untuk tiap kendaraan
+// - TAMBAH: Laser depan (v._laser) diupdate setiap frame dan digambar di debug
+
 export function createVehMovController(options = {}) {
   const config = options.config || {};
   const laneCoordinates = options.laneCoordinates || { entry: {}, exit: {} };
@@ -15,19 +25,62 @@ export function createVehMovController(options = {}) {
   const truckRearOverhangMeters = options.truckRearOverhangMeters ?? 3.5;
   const truckAxleSpacing = options.truckAxleSpacing || { frontToFirstRear: 5.8, firstRearToSecondRear: 1.3 };
 
+  // debug box scale: default 1 => gunakan ukuran penuh kendaraan (1:1)
+  const DEBUG_BOX_SCALE = (typeof options.debugBoxScale === 'number') ? options.debugBoxScale : 1.0;
+
+  // apakah auto-rotate kotak bila sprite tidak bedakan depan/belakang (default true)
+  const AUTO_ROTATE_SYMMETRIC_BOX = (typeof options.autoRotateSymmetricBox === 'boolean') ? options.autoRotateSymmetricBox : true;
+
+  // spawn margin (berapa jauh dari tepi canvas kendaraan mulai)
+  const SPAWN_MARGIN = (typeof options.spawnMargin === 'number') ? options.spawnMargin : 200;
+
+  // ---------- Laser config (dapat di-override via options) ----------
+  const LASER_LENGTH_PX = (typeof options.laserLengthPx === 'number') ? options.laserLengthPx : 60;
+  const LASER_SAFE_STOP_PX = (typeof options.laserSafeStopPx === 'number') ? options.laserSafeStopPx : 15;
+  const LASER_DRAW_ENABLED = (typeof options.laserDraw === 'boolean') ? options.laserDraw : true;
+
+  // ---------- unit conversion helpers (10 px = 1 m) ----------
+  const PX_PER_M = (typeof options.pxPerMeter === 'number') ? options.pxPerMeter : 10;
+
+  // default sample spacing (px) — bisa disesuaikan
+  const DEFAULT_SAMPLE_SPACING_PX = Math.max(4, Math.round(PX_PER_M * 0.5)); // ~0.5 m
+
+  // helper konversi: m/s -> px/ms ; m/s^2 -> px/ms^2
+  function mps_to_px_per_ms(v_mps) { return (v_mps * PX_PER_M) / 1000; }
+  function mps2_to_px_per_ms2(a_mps2) { return (a_mps2 * PX_PER_M) / 1_000_000; }
+
+  // default physical tuning (dalam m/s^2 kemudian dikonversi)
+  const DEFAULT_ACCEL_MPS2 = (typeof options.accelMps2 === 'number') ? options.accelMps2 : 1.5; // ~comfortable accel
+  const DEFAULT_BRAKE_MPS2 = (typeof options.brakeMps2 === 'number') ? options.brakeMps2 : 4.0; // emergency-ish decel
+  const DEFAULT_ACCEL = mps2_to_px_per_ms2(DEFAULT_ACCEL_MPS2);
+  const DEFAULT_BRAKE_DECEL = mps2_to_px_per_ms2(DEFAULT_BRAKE_MPS2);
+
+  // reaction time (ms)
+  const DEFAULT_REACTION_MS = (typeof options.reactionTimeMs === 'number') ? options.reactionTimeMs : 1200;
+
+  // detection range (in px) default ~ 50 m -> 50 * PX_PER_M
+  const DETECTION_RANGE = (typeof options.detectionRange === 'number') ? options.detectionRange : (50 * PX_PER_M);
+
+  // desired gap (px)
+  const DESIRED_GAP = (typeof options.desiredGap === 'number') ? options.desiredGap : (1.5 * PX_PER_M); // 1.5 m
+
   const vehicles = [];
   const nextSpawnTimes = { utara: 0, timur: 0, selatan: 0, barat: 0 };
   let nextId = 1;
 
   function nowMs() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
   function skalaPx() { return (config.skala_px || 10) * 3; }
-  const PX_PER_M = 10;
 
   function normalize(v) {
     const L = Math.hypot(v.x || 0, v.y || 0);
     if (L <= 1e-9) return { x: 1, y: 0 };
     return { x: v.x / L, y: v.y / L };
   }
+
+  function dot(a, b) { return a.x * b.x + a.y * b.y; }
+  function sub(a, b) { return { x: a.x - b.x, y: a.y - b.y }; }
+  function add(a, b) { return { x: a.x + b.x, y: a.y + b.y }; }
+  function mul(a, s) { return { x: a.x * s, y: a.y * s }; }
 
   function getExponentialInterval(flowPerHour) {
     if (!flowPerHour || flowPerHour <= 0) return Infinity;
@@ -37,15 +90,33 @@ export function createVehMovController(options = {}) {
   }
 
   function spawnPositionFor(arah, laneIndexZeroBased) {
+    // gunakan SPAWN_MARGIN agar spawn jauh dari canvas
     const s = skalaPx();
     const offset = (laneIndexZeroBased + 0.5) * s;
     let x = 0, y = 0, vx = 0, vy = 0;
     switch (arah) {
-      case 'utara': x = canvasSize.width / 2 + offset; y = -20; vx = 0; vy = 1; break;
-      case 'timur': x = canvasSize.width + 20; y = canvasSize.height / 2 + offset; vx = -1; vy = 0; break;
-      case 'selatan': x = canvasSize.width / 2 - offset; y = canvasSize.height + 20; vx = 0; vy = -1; break;
-      case 'barat': x = -20; y = canvasSize.height / 2 - offset; vx = 1; vy = 0; break;
-      default: x = canvasSize.width / 2; y = -20; vx = 0; vy = 1;
+      case 'utara':
+        x = canvasSize.width / 2 + offset;
+        y = -SPAWN_MARGIN;
+        vx = 0; vy = 1;
+        break;
+      case 'timur':
+        x = canvasSize.width + SPAWN_MARGIN;
+        y = canvasSize.height / 2 + offset;
+        vx = -1; vy = 0;
+        break;
+      case 'selatan':
+        x = canvasSize.width / 2 - offset;
+        y = canvasSize.height + SPAWN_MARGIN;
+        vx = 0; vy = -1;
+        break;
+      case 'barat':
+        x = -SPAWN_MARGIN;
+        y = canvasSize.height / 2 - offset;
+        vx = 1; vy = 0;
+        break;
+      default:
+        x = canvasSize.width / 2; y = -SPAWN_MARGIN; vx = 0; vy = 1;
     }
     return { x, y, vx, vy };
   }
@@ -54,6 +125,20 @@ export function createVehMovController(options = {}) {
   function linePointAt(t, p0, p1) { return { x: p0.x + (p1.x - p0.x) * t, y: p0.y + (p1.y - p0.y) * t }; }
   function lineTangent(p0, p1) { return { x: p1.x - p0.x, y: p1.y - p0.y }; }
   function lineLength(p0, p1) { return Math.hypot(p1.x - p0.x, p1.y - p0.y); }
+
+  // helper: sample points along an edge p0->p1 with approx spacing spacingPx
+  function sampleEdgePoints(p0, p1, spacingPx = DEFAULT_SAMPLE_SPACING_PX, maxSamples = 200) {
+    const dx = p1.x - p0.x, dy = p1.y - p0.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-6) return [{ x: p0.x, y: p0.y }];
+    const n = Math.min(maxSamples, Math.max(1, Math.floor(len / Math.max(1, spacingPx))));
+    const pts = [];
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      pts.push({ x: p0.x + dx * t, y: p0.y + dy * t });
+    }
+    return pts;
+  }
 
   // Quadratic
   function bezierPoint(t, p0, p1, p2) {
@@ -279,7 +364,7 @@ export function createVehMovController(options = {}) {
     return 2.65 * PX_PER_M;
   }
 
-  // Build off-canvas end point given exitDir and exit tangent (colinear)
+  // Build off-canvas end point given exitDir and exit tangent (tangent colinear)
   function offCanvasPointForDirAlongTangent(exitPoint, exitTan) {
     const unit = normalize(exitTan);
     const canvasDiag = Math.hypot(canvasSize.width, canvasSize.height);
@@ -365,11 +450,45 @@ export function createVehMovController(options = {}) {
     v.turnTraveled = 0;
   }
 
+  // ---------- helper: sync front/rear (poros) dari center + heading ----------
+  // heading = angle in radians (vector heading) i.e. atan2(sin, cos)
+  function updateAxlesFromCenter(v, heading = null) {
+    if (!v) return;
+    // derive heading if not provided
+    if (heading === null) {
+      if (typeof v.vx === 'number' && typeof v.vy === 'number' && (Math.abs(v.vx) > 1e-9 || Math.abs(v.vy) > 1e-9)) {
+        heading = Math.atan2(v.vy, v.vx);
+      } else if (typeof v.angle === 'number') {
+        heading = v.angle + Math.PI/2 - ANGLE_ADJUST; // reverse stored angle transform
+      } else {
+        heading = 0;
+      }
+    }
+
+    const half = (typeof v.wheelbase === 'number' && v.wheelbase > 0) ? (v.wheelbase * 0.5) : 0;
+    const cosH = Math.cos(heading), sinH = Math.sin(heading);
+
+    // center -> front = +half * heading ; rear = -half * heading
+    v.frontX = v.x + half * cosH;
+    v.frontY = v.y + half * sinH;
+    v.rearX  = v.x - half * cosH;
+    v.rearY  = v.y - half * sinH;
+
+    // keep v.angle/v.vx/v.vy consistent
+    const dx = v.frontX - v.rearX, dy = v.frontY - v.rearY;
+    if (Math.hypot(dx, dy) > 1e-9) {
+      const head = Math.atan2(dy, dx);
+      v.angle = head - Math.PI/2 + ANGLE_ADJUST;
+      v.vx = Math.cos(head);
+      v.vy = Math.sin(head);
+    }
+  }
+
   // ---------- create vehicle ----------
   function createVehicle(arah, laneIndexZeroBased, type = 'mobil', exitLane = null) {
     const spawn = spawnPositionFor(arah, laneIndexZeroBased);
     const id = nextId++;
-    const baseSpeed = options.baseSpeed || 0.10;
+    const baseSpeed = (typeof options.baseSpeed === 'number') ? options.baseSpeed : mps_to_px_per_ms(10); // default ~10 m/s
 
     const initialHeading = Math.atan2(spawn.vy, spawn.vx);
     const v = {
@@ -392,35 +511,46 @@ export function createVehMovController(options = {}) {
       blend: null,
       rearX: null, rearY: null,
       frontX: null, frontY: null,
-      path: null
+      path: null,
+      // physics properties:
+      lengthPx: 0,
+      widthPx: 0,
+      mass: 1, // derived later
+      // laser state (updated each frame)
+      _laser: null
     };
 
     if (v.type === 'truk') {
       const frontOverhangPx = truckFrontOverhangMeters * PX_PER_M;
       const frontToFirstRearPx = truckAxleSpacing.frontToFirstRear * PX_PER_M;
-      const firstRearToSecondRearPx = truckAxleSpacing.firstRearToSecondRear * PX_PER_M;
+      const firstRearToSecondRearPx = (truckAxleSpacing.firstToSecondRear ? truckAxleSpacing.firstToSecondRear * PX_PER_M : (truckAxleSpacing.firstRearToSecondRear ? truckAxleSpacing.firstRearToSecondRear * PX_PER_M : 0));
       const rearOverhangPx = truckRearOverhangMeters * PX_PER_M;
-      const totalLenPx = (truckLengthMeters * PX_PER_M);
 
       v.axles = { frontOverhangPx, frontToFirstRearPx, firstRearToSecondRearPx, rearOverhangPx };
       v.spriteOffsetFrontPx = frontOverhangPx;
       v.spriteOffsetRearPx = frontToFirstRearPx + firstRearToSecondRearPx + rearOverhangPx;
       v.wheelbase = frontToFirstRearPx;
-      v.lengthPx = totalLenPx;
+      // Use requested canvas sizes (1:1)
+      v.lengthPx = 120; // truck length in px
+      v.widthPx = 25;   // truck width in px
     } else {
       v.axles = { frontOverhangPx: 0, rearOverhangPx: 0 };
       v.spriteOffsetFrontPx = 0;
       v.spriteOffsetRearPx = 0;
-      v.lengthPx = (type === 'motor') ? 2.0 * PX_PER_M : 4.5 * PX_PER_M;
+      // Use requested canvas sizes for motor and mobil
+      if (v.type === 'motor') {
+        v.lengthPx = 17.5; v.widthPx = 7.0;
+      } else {
+        // default 'mobil' and others -> UPDATED per request
+        v.lengthPx = 42.0; v.widthPx = 21.0;
+      }
     }
 
-    const centerOffset = v.wheelbase * 0.5;
-    const heading = initialHeading;
-    v.rearX = v.x - centerOffset * Math.cos(heading);
-    v.rearY = v.y - centerOffset * Math.sin(heading);
-    // front position based on arc-length wheelbase ahead along straight spawn dir
-    v.frontX = v.rearX + v.wheelbase * Math.cos(heading);
-    v.frontY = v.rearY + v.wheelbase * Math.sin(heading);
+    // derive mass ~ proportional to length (longer => heavier)
+    v.mass = Math.max(1, v.lengthPx / 100);
+
+    // compute initial axles based on center and heading
+    updateAxlesFromCenter(v, initialHeading);
 
     const entryKey = `${arah}_${v.laneIndex}`;
     const entry = laneCoordinates.entry[entryKey];
@@ -445,8 +575,28 @@ export function createVehMovController(options = {}) {
       v.turning = true;
     }
 
+    // initial debug box compute
+    computeDebugBoxForVehicle(v);
+
     vehicles.push(v);
     return v;
+  }
+
+// 🔹 COUNTER ID per arah dan tipe kendaraan
+  const vehicleCounters = {
+    utara: { motor: 0, mobil: 0, truk: 0 },
+    timur: { motor: 0, mobil: 0, truk: 0 },
+    selatan: { motor: 0, mobil: 0, truk: 0 },
+    barat: { motor: 0, mobil: 0, truk: 0 }
+  };
+
+  // 🔹 Fungsi pembuat ID kendaraan
+  function generateVehicleID(type, arah) {
+    const kodeArah = { utara: 'U', timur: 'T', selatan: 'S', barat: 'B' }[arah] || '';
+    const tipeKode = type === 'motor' ? 'MC' : type === 'mobil' ? 'LV' : 'HV';
+    vehicleCounters[arah][type]++;
+    const nomor = vehicleCounters[arah][type];
+    return `${tipeKode}${nomor}${kodeArah}`;
   }
 
   function spawnRandomVehicle(forcedDirection = null) {
@@ -471,19 +621,361 @@ export function createVehMovController(options = {}) {
     nextSpawnTimes[arah] = currentTimeMs + interval;
   }
 
+  // ---------- helper: compute & update debugBox data for a vehicle ----------
+  // Now produces an oriented bounding box (corners), axes (unit normals), center, half-extents
+  function computeDebugBoxForVehicle(v) {
+    // Prefer heading derived from rear->front if available (fixes truck orientation)
+    let headingAngle = null;
+    if (typeof v.frontX === 'number' && typeof v.frontY === 'number' && typeof v.rearX === 'number' && typeof v.rearY === 'number') {
+      const dx = v.frontX - v.rearX;
+      const dy = v.frontY - v.rearY;
+      if (Math.hypot(dx, dy) > 1e-6) headingAngle = Math.atan2(dy, dx);
+    }
+    // fallback: try to derive from v.vx/vy or v.angle
+    if (headingAngle === null) {
+      if (typeof v.vx === 'number' && typeof v.vy === 'number' && (Math.abs(v.vx) > 1e-6 || Math.abs(v.vy) > 1e-6)) {
+        headingAngle = Math.atan2(v.vy, v.vx);
+      } else if (typeof v.angle === 'number') {
+        // note: v.angle was stored as (heading - PI/2 + ANGLE_ADJUST) historically
+        // recover heading by reversing that transform:
+        headingAngle = v.angle + Math.PI/2 - ANGLE_ADJUST;
+      } else {
+        headingAngle = 0;
+      }
+    }
+
+    // boxAngle: align box major axis with headingAngle
+    let boxAngle = headingAngle;
+
+    // width & length: use stored properties directly (1:1 with canvas sprite sizes)
+    const width = (typeof v.widthPx === 'number' && v.widthPx > 0) ? v.widthPx : (v.type === 'truk' ? 25 : (v.type === 'motor' ? 7 : 21));
+    const length = (typeof v.lengthPx === 'number' && v.lengthPx > 0) ? v.lengthPx : (v.type === 'truk' ? 120 : (v.type === 'motor' ? 17.5 : 42));
+
+    // Determine if sprite distinguishes front/back:
+    const frontOffset = (typeof v.spriteOffsetFrontPx === 'number') ? v.spriteOffsetFrontPx : 0;
+    const rearOffset = (typeof v.spriteOffsetRearPx === 'number') ? v.spriteOffsetRearPx : 0;
+    // consider front/back distinct if offsets differ OR length is noticeably larger than width
+    const frontBackDistinct = (Math.abs(frontOffset - rearOffset) > 1e-6) || (length > width + 1e-3);
+
+    if (!frontBackDistinct && AUTO_ROTATE_SYMMETRIC_BOX) {
+      // rotate 90 degrees (pi/2) so the narrow side aligns with forward direction only for truly symmetric sprites
+      boxAngle += Math.PI / 2;
+    }
+
+    const halfL = length / 2;
+    const halfW = width / 2;
+    const cosA = Math.cos(boxAngle);
+    const sinA = Math.sin(boxAngle);
+
+    // corners order: front-right, front-left, rear-left, rear-right (clockwise)
+    const fr = { x: v.x + halfL * cosA - halfW * sinA, y: v.y + halfL * sinA + halfW * cosA };
+    const fl = { x: v.x + halfL * cosA + halfW * sinA, y: v.y + halfL * sinA - halfW * cosA };
+    const rl = { x: v.x - halfL * cosA + halfW * sinA, y: v.y - halfL * sinA - halfW * cosA };
+    const rr = { x: v.x - halfL * cosA - halfW * sinA, y: v.y - halfL * sinA + halfW * cosA };
+
+    const corners = [fr, fl, rl, rr];
+
+    // axes: two unit vectors (edge directions) to use in SAT.
+    const edge0 = normalize({ x: fl.x - fr.x, y: fl.y - fr.y }); // across width
+    const edge1 = normalize({ x: rr.x - fr.x, y: rr.y - fr.y }); // along length (front->rear)
+    const axes = [ { x: edge0.x, y: edge0.y }, { x: edge1.x, y: edge1.y } ];
+
+    // compute front/rear approximate points for consumers (average of front corners / rear corners)
+    const dbFront = { x: (fr.x + fl.x) * 0.5, y: (fr.y + fl.y) * 0.5 };
+    const dbRear  = { x: (rr.x + rl.x) * 0.5, y: (rr.y + rl.y) * 0.5 };
+
+    // store half extents along those edge axes for quick checks (not strictly necessary)
+    v.debugBox = {
+      corners,
+      center: { x: v.x, y: v.y },
+      axes,
+      halfExtents: { halfL, halfW },
+      width, length,
+      angle: boxAngle,
+      scale: DEBUG_BOX_SCALE,
+      _frontBackDistinct: frontBackDistinct,
+      _usedHeadingFromAxles: (headingAngle !== null),
+      // extras for convenience:
+      front: dbFront,
+      rear: dbRear
+    };
+
+    // ------------------ SAMPLING: perimeter & centerline ------------------
+    try {
+      // spacing in px (allow override via options.debugSampleSpacingPx)
+      const spacing = (typeof options.debugSampleSpacingPx === 'number') ? options.debugSampleSpacingPx : DEFAULT_SAMPLE_SPACING_PX;
+      const maxSamplesPerEdge = 80; // safety cap per edge
+      const perimSamples = [];
+
+      // sample each edge (fr->fl, fl->rl, rl->rr, rr->fr) and avoid duplicated corner repeats
+      const cornerList = corners;
+      for (let ei = 0; ei < 4; ei++) {
+        const a = cornerList[ei];
+        const b = cornerList[(ei + 1) % 4];
+        const s = sampleEdgePoints(a, b, spacing, maxSamplesPerEdge);
+        // for edges after first, drop the first point to avoid duplicating the previous corner
+        if (ei > 0 && s.length) s.shift();
+        perimSamples.push(...s);
+      }
+
+      // centerline samples (rear -> front)
+      const centerLineSamples = sampleEdgePoints(dbRear, dbFront, spacing, 200);
+
+      // attach samples to debugBox for consumers (antrian.js etc.)
+      v.debugBox.perimeterSamples = perimSamples;
+      v.debugBox.centerlineSamples = centerLineSamples;
+    } catch (e) {
+      // sampling should not break simulation; swallow errors
+      v.debugBox.perimeterSamples = v.debugBox.perimeterSamples || [];
+      v.debugBox.centerlineSamples = v.debugBox.centerlineSamples || [];
+      console && console.warn && console.warn("sampling debugBox failed for veh#", v.id, e);
+    }
+    // ---------------------------------------------------------------------
+  }
+
+  // ---------- NEW: Laser update helper ----------
+  // Creates three parallel forward rays: center (for backwards compatibility) + left corner + right corner.
+  function updateLaserForVehicle(v) {
+    if (!v) return;
+    // ensure laser object exists
+    v._laser = v._laser || {};
+    // clear hit info; antrian.js may set .center.hit/.left.hit/.right.hit later
+    v._laser.center = v._laser.center || {};
+    v._laser.left = v._laser.left || {};
+    v._laser.right = v._laser.right || {};
+    v._laser.center.hit = false; v._laser.left.hit = false; v._laser.right.hit = false;
+    v._laser.center.hitId = null; v._laser.left.hitId = null; v._laser.right.hitId = null;
+
+    // Determine forward unit vector (prefer axle vector front - rear, then vx/vy, then angle)
+    let ux = 1, uy = 0;
+    if (typeof v.frontX === 'number' && typeof v.rearX === 'number') {
+      const dx = v.frontX - v.rearX, dy = v.frontY - v.rearY;
+      const L = Math.hypot(dx, dy) || 1;
+      ux = dx / L; uy = dy / L;
+    } else if (typeof v.vx === 'number' && typeof v.vy === 'number' && (Math.abs(v.vx) > 1e-9 || Math.abs(v.vy) > 1e-9)) {
+      const L = Math.hypot(v.vx, v.vy) || 1;
+      ux = v.vx / L; uy = v.vy / L;
+    } else if (typeof v.angle === 'number') {
+      const heading = v.angle + Math.PI/2 - ANGLE_ADJUST;
+      ux = Math.cos(heading); uy = Math.sin(heading);
+    }
+
+    // Center start: prefer debugBox.front then frontX/frontY then center+half-length
+    let centerStart = null;
+    if (v.debugBox && v.debugBox.front) centerStart = { x: v.debugBox.front.x, y: v.debugBox.front.y };
+    else if (typeof v.frontX === 'number' && typeof v.frontY === 'number') centerStart = { x: v.frontX, y: v.frontY };
+    else {
+      const heading = (typeof v.angle === 'number') ? (v.angle + Math.PI/2 - ANGLE_ADJUST) : Math.atan2(uy, ux);
+      const half = (v.lengthPx || 40) * 0.5;
+      centerStart = { x: v.x + Math.cos(heading) * half, y: v.y + Math.sin(heading) * half };
+    }
+
+    // Corner starts: prefer debugBox.corners[0]=fr and [1]=fl. If missing, derive from centerStart +/- lateral vector
+    let fr = null, fl = null;
+    if (v.debugBox && Array.isArray(v.debugBox.corners) && v.debugBox.corners.length >= 4) {
+      fr = v.debugBox.corners[0];
+      fl = v.debugBox.corners[1];
+    } else {
+      // derive lateral vector perpendicular to forward (ux,uy)
+      const lx = -uy, ly = ux; // left is +lx,+ly
+      const halfW = (v.widthPx || 20) * 0.5;
+      // front-right = centerStart - halfW * leftVector
+      fr = { x: centerStart.x - lx * halfW, y: centerStart.y - ly * halfW };
+      fl = { x: centerStart.x + lx * halfW, y: centerStart.y + ly * halfW };
+    }
+
+    // Build ray objects: start + end (length LASER_LENGTH_PX forward)
+    const len = LASER_LENGTH_PX;
+    const centerEnd = { x: centerStart.x + ux * len, y: centerStart.y + uy * len };
+    const leftEnd = { x: fl.x + ux * len, y: fl.y + uy * len };
+    const rightEnd = { x: fr.x + ux * len, y: fr.y + uy * len };
+
+    // Store in v._laser for consumers (antrian.js)
+    v._laser.center.start = { x: centerStart.x, y: centerStart.y };
+    v._laser.center.end = centerEnd;
+    v._laser.center.ux = ux; v._laser.center.uy = uy; v._laser.center.length = len;
+
+    v._laser.left.start = { x: fl.x, y: fl.y };
+    v._laser.left.end = leftEnd;
+    v._laser.left.ux = ux; v._laser.left.uy = uy; v._laser.left.length = len;
+
+    v._laser.right.start = { x: fr.x, y: fr.y };
+    v._laser.right.end = rightEnd;
+    v._laser.right.ux = ux; v._laser.right.uy = uy; v._laser.right.length = len;
+
+    // maintain top-level compatibility fields: v._laser.start/end point to center ray
+    v._laser.start = v._laser.center.start;
+    v._laser.end = v._laser.center.end;
+    v._laser.ux = ux; v._laser.uy = uy;
+    v._laser.length = len;
+
+    // leave hit flags to antrian.js (which will check each ray individually if implemented)
+  }
+
+  // ---------- SAT helpers for OBB (rectangles) ----------
+  function projectOntoAxis(points, axis) {
+    let min = Infinity, max = -Infinity;
+    for (const p of points) {
+      const proj = p.x * axis.x + p.y * axis.y;
+      if (proj < min) min = proj;
+      if (proj > max) max = proj;
+    }
+    return { min, max };
+  }
+  function intervalOverlap(aMin, aMax, bMin, bMax) {
+    return Math.max(0, Math.min(aMax, bMax) - Math.max(aMin, bMin));
+  }
+
+  function obbOverlapMTV(dbA, dbB) {
+    const axesToTest = [];
+    for (const a of dbA.axes) axesToTest.push({ x: -a.y, y: a.x });
+    for (const a of dbB.axes) axesToTest.push({ x: -a.y, y: a.x });
+
+    let minOverlap = Infinity;
+    let smallestAxis = null;
+    let direction = 1;
+
+    for (const rawAxis of axesToTest) {
+      const len = Math.hypot(rawAxis.x, rawAxis.y);
+      if (len <= 1e-9) continue;
+      const axis = { x: rawAxis.x / len, y: rawAxis.y / len };
+
+      const projA = projectOntoAxis(dbA.corners, axis);
+      const projB = projectOntoAxis(dbB.corners, axis);
+
+      const ov = Math.max(0, Math.min(projA.max, projB.max) - Math.max(projA.min, projB.min));
+      if (ov <= 0) {
+        return null;
+      }
+      if (ov < minOverlap) {
+        minOverlap = ov;
+        smallestAxis = axis;
+        const centerDelta = { x: dbB.center.x - dbA.center.x, y: dbB.center.y - dbA.center.y };
+        const sign = (centerDelta.x * axis.x + centerDelta.y * axis.y) >= 0 ? 1 : -1;
+        direction = sign;
+      }
+    }
+    if (!smallestAxis) return null;
+    return { overlap: minOverlap, axis: smallestAxis, direction };
+  }
+
+  // ---------- helper: find nearest vehicle ahead ----------
+  function findVehicleAhead(v) {
+    // forward unit vector for v: use rear->front if available; otherwise derive from vx/vy
+    let forward = null;
+    if (typeof v.frontX === 'number' && typeof v.frontY === 'number' && typeof v.rearX === 'number' && typeof v.rearY === 'number') {
+      forward = normalize({ x: v.frontX - v.rearX, y: v.frontY - v.rearY });
+    } else if (typeof v.vx === 'number' && typeof v.vy === 'number' && (Math.abs(v.vx) > 1e-6 || Math.abs(v.vy) > 1e-6)) {
+      forward = normalize({ x: v.vx, y: v.vy });
+    } else {
+      // fallback from angle
+      const heading = (typeof v.angle === 'number') ? (v.angle + Math.PI/2 - ANGLE_ADJUST) : 0;
+      forward = { x: Math.cos(heading), y: Math.sin(heading) };
+    }
+    const perp = { x: -forward.y, y: forward.x };
+
+    let best = null;
+    for (const other of vehicles) {
+      if (other === v) continue;
+      // quick distance culling
+      const dx = other.x - v.x, dy = other.y - v.y;
+      const proj = dx * forward.x + dy * forward.y; // forward distance from centers
+      if (proj <= 2) continue; // behind or extremely close negative
+      if (proj > DETECTION_RANGE) continue; // out of detection range
+
+      const lateral = Math.abs(dx * perp.x + dy * perp.y);
+      // require lateral overlap roughly within lane width: use max widths * 1.2
+      const laneThreshold = Math.max(v.widthPx, other.widthPx) * 1.2 + DESIRED_GAP;
+      if (lateral > laneThreshold) continue;
+
+      // choose nearest in front (smallest proj)
+      if (!best || proj < best.proj) {
+        best = { other, proj, lateral, dx, dy };
+      }
+    }
+    return best; // null or object
+  }
+
   // ---------- MAIN UPDATE ----------
   function update(deltaMs) {
     if (!deltaMs || deltaMs <= 0) return;
 
+    // First: decide desired speed for each vehicle based on vehicle ahead (no collision push)
+    for (const v of vehicles) {
+      // per-vehicle tuning (use provided or fallback to defaults converted to px/ms^2)
+      const accel = (typeof v._accel === 'number') ? v._accel : DEFAULT_ACCEL;
+      const brakeDecel = (typeof v._brakeDecel === 'number') ? v._brakeDecel : DEFAULT_BRAKE_DECEL;
+      const reactionMs = (typeof v._reactionMs === 'number') ? v._reactionMs : DEFAULT_REACTION_MS;
+      // baseSpeed may be passed in px/ms; if user used m/s, they must convert externally
+      const baseSpeed = (typeof options.baseSpeed === 'number') ? options.baseSpeed : mps_to_px_per_ms(10); // default 10 m/s
+
+      // detect vehicle ahead
+      const ahead = findVehicleAhead(v);
+      let desiredSpeed = baseSpeed; // px/ms
+
+      if (ahead && ahead.other) {
+        const other = ahead.other;
+        // compute half lengths
+        const halfLenV = (v.lengthPx || 0) / 2;
+        const halfLenO = (other.lengthPx || 0) / 2;
+        // distance between vehicle centers along forward axis minus half-lengths -> gap
+        const totalCenterSep = Math.max(0, ahead.proj);
+        const gap = Math.max(0, totalCenterSep - (halfLenV + halfLenO));
+
+        // braking distance estimate using reaction time + kinetic braking distance: v*tr + v^2/(2*a)
+        const vSpeed = v.speed || 0; // px/ms
+        const brakingDistance = vSpeed * reactionMs + ((vSpeed * vSpeed) / (2 * Math.max(1e-9, brakeDecel)));
+
+        const minAllowed = DESIRED_GAP + brakingDistance; // gap we want to maintain
+
+        // If gap <= minAllowed => must stop (or keep zero desired)
+        if (gap <= minAllowed) {
+          desiredSpeed = 0;
+        } else {
+          // otherwise choose a speed that smoothly approaches baseSpeed as gap increases
+          // Use simple linear interpolation: when gap == minAllowed -> 0 ; when gap >= minAllowed + ramp -> baseSpeed
+          const ramp = Math.max(PX_PER_M * 5, minAllowed); // make ramp at least ~5 m or proportional
+          const t = Math.min(1, (gap - minAllowed) / ramp);
+          desiredSpeed = baseSpeed * t;
+          // small floor
+          if (desiredSpeed < mps_to_px_per_ms(0.2)) desiredSpeed = mps_to_px_per_ms(0.2); // avoid near-zero crawl unless necessary
+        }
+      } else {
+        // no obstacle detected: drive at base speed
+        desiredSpeed = (typeof v.desiredSpeed === 'number') ? v.desiredSpeed : baseSpeed;
+      }
+
+      // store desiredSpeed to use in motion update
+      v._desiredSpeed = desiredSpeed;
+      v._accelRate = accel;
+      v._brakeRate = brakeDecel;
+      v._reactionMs = (typeof options.reactionTimeMs === 'number') ? options.reactionTimeMs : DEFAULT_REACTION_MS;
+    }
+
+    // Now move each vehicle applying acceleration / braking and existing path logic
     for (let i = vehicles.length - 1; i >= 0; i--) {
       const v = vehicles[i];
+      const EPS = 1e-9;
+
+      // Smoothly change v.speed toward v._desiredSpeed
+      const desired = (typeof v._desiredSpeed === 'number') ? v._desiredSpeed : ((typeof options.baseSpeed === 'number') ? options.baseSpeed : mps_to_px_per_ms(10));
+      const accelRate = (typeof v._accelRate === 'number') ? v._accelRate : DEFAULT_ACCEL;
+      const brakeRate = (typeof v._brakeRate === 'number') ? v._brakeRate : DEFAULT_BRAKE_DECEL;
+
+      if (v.speed < desired) {
+        // accelerate
+        v.speed = Math.min(desired, v.speed + accelRate * deltaMs);
+      } else if (v.speed > desired) {
+        // brake (stronger)
+        v.speed = Math.max(desired, v.speed - brakeRate * deltaMs);
+      }
+
+      // then apply movement same as before but using v.speed as travel rate
       let moveBudget = v.speed * deltaMs;
-      const EPS = 1e-6;
 
       while (moveBudget > EPS) {
         // approachingTurn: find closest on path -> create blend or snap
         if (v.approachingTurn && v.path) {
-          const rearCenterOffset = 0; // rear point is rear axle
           const centerOffset = v.wheelbase * 0.5;
           const estHeading = (v.angle ?? 0) + Math.PI/2 - ANGLE_ADJUST;
           const estRear = { x: v.x - centerOffset * Math.cos(estHeading), y: v.y - centerOffset * Math.sin(estHeading) };
@@ -507,14 +999,15 @@ export function createVehMovController(options = {}) {
             v.approachingTurn = false;
             // compute front based on arc-length (rear + wheelbase along path)
             const frontD = Math.min(v.turnTraveled + v.wheelbase, v.path.totalLength);
-            const { p: frontPt, tan: frontTan } = pathPointAndTangentAtDistance(v.path, frontD);
+            const { p: frontPt } = pathPointAndTangentAtDistance(v.path, frontD);
             v.frontX = frontPt.x; v.frontY = frontPt.y;
             const { tan } = pathPointAndTangentAtDistance(v.path, v.turnTraveled);
             const unitTan = normalize(tan);
             const heading = Math.atan2(unitTan.y, unitTan.x);
             v.x = v.rearX + centerOffset * unitTan.x;
             v.y = v.rearY + centerOffset * unitTan.y;
-            v.angle = heading - Math.PI/2 + ANGLE_ADJUST;
+            // sync axles/angle consistently from path-derived front/rear
+            updateAxlesFromCenter(v, heading);
             continue;
           } else {
             // prepare center target using tangent (unit) and compute target front too
@@ -557,10 +1050,10 @@ export function createVehMovController(options = {}) {
             v.turnProgress = v.turnLength > 0 ? (v.turnTraveled / v.turnLength) : 0;
             v.blend = null;
             v.turning = true;
-            // set angle using vector between rear->front
+            // set angle using vector between rear->front (path-derived)
             const dx = v.frontX - v.rearX, dy = v.frontY - v.rearY;
             const heading = Math.atan2(dy, dx);
-            v.angle = heading - Math.PI/2 + ANGLE_ADJUST;
+            updateAxlesFromCenter(v, heading);
             continue;
           }
 
@@ -568,8 +1061,11 @@ export function createVehMovController(options = {}) {
           const ux = bx / distToTarget, uy = by / distToTarget;
           v.x += ux * move;
           v.y += uy * move;
-          // during blend we orient center towards the direction of motion (cosmetic)
-          v.angle = Math.atan2(uy, ux) - Math.PI/2 + ANGLE_ADJUST;
+
+          // update poros agar titik depan/belakang selalu mengikuti pusat selama blending
+          const motionHeading = Math.atan2(uy, ux); // heading of motion
+          updateAxlesFromCenter(v, motionHeading);
+
           moveBudget -= move;
           v.blend.remaining -= move;
 
@@ -584,7 +1080,7 @@ export function createVehMovController(options = {}) {
             v.turning = true;
             const dx = v.frontX - v.rearX, dy = v.frontY - v.rearY;
             const heading = Math.atan2(dy, dx);
-            v.angle = heading - Math.PI/2 + ANGLE_ADJUST;
+            updateAxlesFromCenter(v, heading);
             continue;
           } else {
             break;
@@ -603,15 +1099,15 @@ export function createVehMovController(options = {}) {
             // final rear and front
             const rearD = v.turnTraveled;
             const frontD = Math.min(rearD + v.wheelbase, v.path.totalLength);
-            const { p: rearPt, tan: rearTan } = pathPointAndTangentAtDistance(v.path, rearD);
-            const { p: frontPt, tan: frontTan } = pathPointAndTangentAtDistance(v.path, frontD);
+            const { p: rearPt } = pathPointAndTangentAtDistance(v.path, rearD);
+            const { p: frontPt } = pathPointAndTangentAtDistance(v.path, frontD);
             v.rearX = rearPt.x; v.rearY = rearPt.y;
             v.frontX = frontPt.x; v.frontY = frontPt.y;
             const dx = v.frontX - v.rearX, dy = v.frontY - v.rearY;
             const finalHeading = Math.atan2(dy, dx);
             v.vx = Math.cos(finalHeading); v.vy = Math.sin(finalHeading);
-            v.angle = Math.atan2(v.vy, v.vx) - Math.PI/2 + ANGLE_ADJUST;
-            // recompute center consistent with rear & front
+            updateAxlesFromCenter(v, finalHeading);
+            // recompute center consistent with rear & front (updateAxlesFromCenter set them already)
             const centerOffset = v.wheelbase * 0.5;
             v.x = v.rearX + centerOffset * Math.cos(finalHeading);
             v.y = v.rearY + centerOffset * Math.sin(finalHeading);
@@ -626,8 +1122,8 @@ export function createVehMovController(options = {}) {
           // get rear point and tangent at exact traveled distance
           const rearD = v.turnTraveled;
           const frontD = Math.min(rearD + v.wheelbase, v.path.totalLength);
-          const { p: rear, tan: rearTan } = pathPointAndTangentAtDistance(v.path, rearD);
-          const { p: front, tan: frontTan } = pathPointAndTangentAtDistance(v.path, frontD);
+          const { p: rear } = pathPointAndTangentAtDistance(v.path, rearD);
+          const { p: front } = pathPointAndTangentAtDistance(v.path, frontD);
 
           v.rearX = rear.x; v.rearY = rear.y;
           v.frontX = front.x; v.frontY = front.y;
@@ -642,7 +1138,7 @@ export function createVehMovController(options = {}) {
           const cy = v.rearY + centerOffset * unit.y;
 
           v.x = cx; v.y = cy;
-          v.angle = headingAngle - Math.PI/2 + ANGLE_ADJUST;
+          updateAxlesFromCenter(v, headingAngle);
 
           moveBudget -= use;
 
@@ -651,14 +1147,14 @@ export function createVehMovController(options = {}) {
             v.turning = false;
             const finalRearD = v.turnLength;
             const finalFrontD = Math.min(finalRearD + v.wheelbase, v.path.totalLength);
-            const { p: finalRearPt, tan: finalRearTan } = pathPointAndTangentAtDistance(v.path, finalRearD);
+            const { p: finalRearPt } = pathPointAndTangentAtDistance(v.path, finalRearD);
             const { p: finalFrontPt } = pathPointAndTangentAtDistance(v.path, finalFrontD);
             v.rearX = finalRearPt.x; v.rearY = finalRearPt.y;
             v.frontX = finalFrontPt.x; v.frontY = finalFrontPt.y;
             const dx2 = v.frontX - v.rearX, dy2 = v.frontY - v.rearY;
             const finalHeading = Math.atan2(dy2, dx2);
             v.vx = Math.cos(finalHeading); v.vy = Math.sin(finalHeading);
-            v.angle = Math.atan2(v.vy, v.vx) - Math.PI/2 + ANGLE_ADJUST;
+            updateAxlesFromCenter(v, finalHeading);
             const centerOffset2 = v.wheelbase * 0.5;
             v.x = v.rearX + centerOffset2 * Math.cos(finalHeading);
             v.y = v.rearY + centerOffset2 * Math.sin(finalHeading);
@@ -674,42 +1170,63 @@ export function createVehMovController(options = {}) {
         v.x += (v.vx || 0) * move;
         v.y += (v.vy || 0) * move;
         moveBudget = 0;
-        if ((v.vx || 0) !== 0 || (v.vy || 0) !== 0) v.angle = Math.atan2(v.vy, v.vx) - Math.PI/2 + ANGLE_ADJUST;
+
+        // sync axles/poros berdasarkan heading dari vx/vy (atau v.angle)
+        if ((v.vx || 0) !== 0 || (v.vy || 0) !== 0) {
+          const head = Math.atan2(v.vy, v.vx);
+          updateAxlesFromCenter(v, head);
+        } else {
+          if (typeof v.angle === 'number') updateAxlesFromCenter(v, v.angle + Math.PI/2 - ANGLE_ADJUST);
+        }
         break;
       } // end while
 
-      // remove if out of canvas bounds
-      const margin = 60;
+      // compute & update debugBox for this vehicle so antrian.js (or others) can use it immediately
+      try {
+        // As a safety: if vehicle is NOT following path or blend, ensure axles are in sync
+        if (!v.turning && !v.blend) {
+          let h = null;
+          if (typeof v.vx === 'number' && typeof v.vy === 'number' && (Math.abs(v.vx) > 1e-9 || Math.abs(v.vy) > 1e-9)) {
+            h = Math.atan2(v.vy, v.vx);
+          } else if (typeof v.angle === 'number') {
+            h = v.angle + Math.PI/2 - ANGLE_ADJUST;
+          }
+          updateAxlesFromCenter(v, h);
+        }
+
+        computeDebugBoxForVehicle(v);
+
+        // update laser geometry for this vehicle (center + corner lasers)
+        updateLaserForVehicle(v);
+      } catch (e) {
+        console.warn("computeDebugBoxForVehicle failed for veh#", v.id, e);
+      }
+
+      // remove if out of canvas bounds (with margin)
+      const margin = SPAWN_MARGIN + 60;
       if (v.x < -margin || v.x > canvasSize.width + margin || v.y < -margin || v.y > canvasSize.height + margin) {
         vehicles.splice(i, 1);
       }
-    } // end for
-  }
+    } // end per-vehicle movement
 
-  // ---------- external API ----------
-  function getVehicles() { return vehicles.slice(); }
-  function clear() { vehicles.length = 0; nextId = 1; }
-  function setTrafficConfig(obj) { trafficConfig = obj || trafficConfig; }
-  function setCanvasSize(sz) { if (sz?.width && sz?.height) { canvasSize.width = sz.width; canvasSize.height = sz.height; } }
-
-  function setLaneCoordinates(newLc) {
-    if (!newLc) return;
-    laneCoordinates.entry = newLc.entry || laneCoordinates.entry || {};
-    laneCoordinates.exit = newLc.exit || laneCoordinates.exit || {};
-    for (const v of vehicles) {
-      try { assignExitAndControlForVehicle(v); } catch (e) { console.warn("setLaneCoordinates: reassign failed for veh#", v.id, e); }
-    }
+    // NOTE: collision push / resolution intentionally removed.
+    // We only detect vehicles ahead and slow down; collisions (overlap) will not be corrected by displacement.
   }
 
   // ---------- debug draw ----------
   function drawDebugPoints(ctx) {
     vehicles.forEach(v => {
+      // Ensure debugBox exists so corner dots are correct
+      if (!v.debugBox) {
+        try { computeDebugBoxForVehicle(v); } catch (e) {}
+      }
+
       if (v.controlType === 'quadratic' && v.controlPoint) {
-        ctx.save(); ctx.fillStyle = "purple"; ctx.beginPath();
+        ctx.save(); ctx.fillStyle = "magenta"; ctx.beginPath();
         ctx.arc(v.controlPoint.x, v.controlPoint.y, 5, 0, 2 * Math.PI); ctx.fill(); ctx.restore();
       }
       if (v.controlType === 'cubic' && v.controlPoints && v.controlPoints.length === 2) {
-        ctx.save(); ctx.fillStyle = "purple"; ctx.beginPath();
+        ctx.save(); ctx.fillStyle = "magenta"; ctx.beginPath();
         ctx.arc(v.controlPoints[0].x, v.controlPoints[0].y, 5, 0, 2 * Math.PI); ctx.fill();
         ctx.beginPath(); ctx.arc(v.controlPoints[1].x, v.controlPoints[1].y, 5, 0, 2 * Math.PI); ctx.fill();
         ctx.restore();
@@ -718,16 +1235,88 @@ export function createVehMovController(options = {}) {
         ctx.save(); ctx.fillStyle = "orange"; ctx.beginPath();
         ctx.arc(v.blend.targetRear.x, v.blend.targetRear.y, 4, 0, 2 * Math.PI); ctx.fill(); ctx.restore();
       }
-      if (v.turnEntry) { ctx.save(); ctx.fillStyle = "rgba(0,160,0,0.9)"; ctx.beginPath(); ctx.arc(v.turnEntry.x, v.turnEntry.y, 3, 0, 2 * Math.PI); ctx.fill(); ctx.restore(); }
-      if (v.turnExit)  { ctx.save(); ctx.fillStyle = "rgba(0,160,0,0.9)"; ctx.beginPath(); ctx.arc(v.turnExit.x, v.turnExit.y, 3, 0, 2 * Math.PI); ctx.fill(); ctx.restore(); }
+      if (v.turnEntry) { ctx.save(); ctx.fillStyle = "lime"; ctx.beginPath(); ctx.arc(v.turnEntry.x, v.turnEntry.y, 3, 0, 2 * Math.PI); ctx.fill(); ctx.restore(); }
+      if (v.turnExit)  { ctx.save(); ctx.fillStyle = "lime"; ctx.beginPath(); ctx.arc(v.turnExit.x, v.turnExit.y, 3, 0, 2 * Math.PI); ctx.fill(); ctx.restore(); }
+
+      // white dots for axles (rear/front)
       if (typeof v.rearX === 'number' && typeof v.rearY === 'number') {
-        ctx.save(); ctx.fillStyle = "blue"; ctx.beginPath();
+        ctx.save(); ctx.fillStyle = "white"; ctx.beginPath();
         ctx.arc(v.rearX, v.rearY, 3, 0, 2 * Math.PI); ctx.fill(); ctx.restore();
       }
       if (typeof v.frontX === 'number' && typeof v.frontY === 'number') {
-        ctx.save(); ctx.fillStyle = "magenta"; ctx.beginPath();
+        ctx.save(); ctx.fillStyle = "white"; ctx.beginPath();
         ctx.arc(v.frontX, v.frontY, 3, 0, 2 * Math.PI); ctx.fill(); ctx.restore();
       }
+
+      // ===== NEW: draw blue dots on each debugBox corner to verify coordinates exist =====
+      if (v.debugBox && Array.isArray(v.debugBox.corners)) {
+        ctx.save();
+        ctx.fillStyle = "deepskyblue"; // jelas terlihat di atas sprite
+        const r = 3; // pixel radius for corner dots
+        for (const c of v.debugBox.corners) {
+          if (c && typeof c.x === 'number' && typeof c.y === 'number') {
+            ctx.beginPath();
+            ctx.arc(c.x, c.y, r, 0, 2 * Math.PI);
+            ctx.fill();
+          }
+        }
+        ctx.restore();
+      }
+
+      // ===== NEW: draw laser lines (green) if enabled =====
+      if (LASER_DRAW_ENABLED && v._laser) {
+        ctx.save();
+        ctx.lineWidth = 2;
+
+        // center ray (compat)
+        if (v._laser.center && v._laser.center.start && v._laser.center.end) {
+          ctx.beginPath();
+          ctx.moveTo(v._laser.center.start.x, v._laser.center.start.y);
+          ctx.lineTo(v._laser.center.end.x, v._laser.center.end.y);
+          ctx.strokeStyle = v._laser.center.hit ? "lime" : "rgba(0,255,0,0.6)";
+          ctx.stroke();
+          if (v._laser.center.hit && v._laser.center.hitPoint) {
+            ctx.fillStyle = "lime";
+            ctx.beginPath();
+            ctx.arc(v._laser.center.hitPoint.x, v._laser.center.hitPoint.y, 3, 0, Math.PI*2);
+            ctx.fill();
+          }
+        }
+
+        // left corner ray
+        if (v._laser.left && v._laser.left.start && v._laser.left.end) {
+          ctx.beginPath();
+          ctx.moveTo(v._laser.left.start.x, v._laser.left.start.y);
+          ctx.lineTo(v._laser.left.end.x, v._laser.left.end.y);
+          ctx.strokeStyle = v._laser.left.hit ? "lime" : "rgba(0,220,0,0.5)";
+          ctx.stroke();
+          if (v._laser.left.hit && v._laser.left.hitPoint) {
+            ctx.fillStyle = "lime";
+            ctx.beginPath();
+            ctx.arc(v._laser.left.hitPoint.x, v._laser.left.hitPoint.y, 3, 0, Math.PI*2);
+            ctx.fill();
+          }
+        }
+
+        // right corner ray
+        if (v._laser.right && v._laser.right.start && v._laser.right.end) {
+          ctx.beginPath();
+          ctx.moveTo(v._laser.right.start.x, v._laser.right.start.y);
+          ctx.lineTo(v._laser.right.end.x, v._laser.right.end.y);
+          ctx.strokeStyle = v._laser.right.hit ? "lime" : "rgba(0,200,0,0.45)";
+          ctx.stroke();
+          if (v._laser.right.hit && v._laser.right.hitPoint) {
+            ctx.fillStyle = "lime";
+            ctx.beginPath();
+            ctx.arc(v._laser.right.hitPoint.x, v._laser.right.hitPoint.y, 3, 0, Math.PI*2);
+            ctx.fill();
+          }
+        }
+
+        ctx.restore();
+      }
+      // ================================================================================
+
     });
   }
 
@@ -735,8 +1324,8 @@ export function createVehMovController(options = {}) {
     vehicles.forEach(v => {
       if (!v.path) return;
       ctx.save();
-      ctx.strokeStyle = "rgba(128,0,128,0.5)";
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(0,0,0,0.15)";
+      ctx.lineWidth = 1;
       ctx.beginPath();
       for (let si = 0; si < v.path.segments.length; si++) {
         const seg = v.path.segments[si];
@@ -752,28 +1341,98 @@ export function createVehMovController(options = {}) {
       }
       ctx.stroke();
       ctx.restore();
-
-      v.path.segments.forEach((seg) => {
-        if (seg.type === 'line') {
-          ctx.save(); ctx.fillStyle = "rgba(0,200,0,0.9)"; ctx.fillRect(seg.p0.x-2, seg.p0.y-2,4,4); ctx.fillRect(seg.p1.x-2, seg.p1.y-2,4,4); ctx.restore();
-        } else if (seg.type === 'quadratic') {
-          ctx.save(); ctx.fillStyle = "rgba(0,200,0,0.9)"; ctx.fillRect(seg.p0.x-2, seg.p0.y-2,4,4); ctx.fillRect(seg.p1.x-2, seg.p1.y-2,4,4); ctx.fillRect(seg.p2.x-2, seg.p2.y-2,4,4); ctx.restore();
-        } else if (seg.type === 'cubic') {
-          ctx.save(); ctx.fillStyle = "rgba(0,200,0,0.9)";
-          ctx.fillRect(seg.p0.x-2, seg.p0.y-2,4,4); ctx.fillRect(seg.p1.x-2, seg.p1.y-2,4,4); ctx.fillRect(seg.p2.x-2, seg.p2.y-2,4,4); ctx.fillRect(seg.p3.x-2, seg.p3.y-2,4,4);
-          ctx.restore();
-        }
-      });
-
-      if (v.blend && v.blend.centerTarget) {
-        ctx.save(); ctx.fillStyle = "orange"; ctx.beginPath(); ctx.arc(v.blend.centerTarget.x, v.blend.centerTarget.y, 3, 0, 2*Math.PI); ctx.fill(); ctx.restore();
-      }
     });
+  }
+
+  // ---------- kotak debug fisik kendaraan (visual draw) ----------
+  function drawDebugBoxes(ctx) {
+    vehicles.forEach(v => {
+      if (!v.debugBox) computeDebugBoxForVehicle(v);
+      const db = v.debugBox;
+      if (!db || !db.corners) return;
+
+      ctx.save();
+      // warna outline berdasarkan tipe
+      if (v.type === "motor") ctx.strokeStyle = "red";
+      else if (v.type === "mobil") ctx.strokeStyle = "yellow";
+      else if (v.type === "truk") ctx.strokeStyle = "green";
+      else ctx.strokeStyle = "white";
+
+      ctx.lineWidth = Math.max(0.8, 1.5);
+      ctx.globalAlpha = 0.9;
+
+      // polygon outline
+      ctx.beginPath();
+      ctx.moveTo(db.corners[0].x, db.corners[0].y);
+      for (let i = 1; i < db.corners.length; i++) ctx.lineTo(db.corners[i].x, db.corners[i].y);
+      ctx.closePath();
+      ctx.stroke();
+
+      // draw center
+      ctx.fillStyle = "rgba(0,255,255,0.9)";
+      ctx.beginPath();
+      ctx.arc(db.center.x, db.center.y, Math.max(1, 3 * (db.scale || 1.0)), 0, 2 * Math.PI);
+      ctx.fill();
+
+      // optional: draw axes for debug
+      ctx.strokeStyle = "rgba(255,255,255,0.15)";
+      ctx.beginPath();
+      const a0 = db.axes[0];
+      ctx.moveTo(db.center.x - a0.x * 20, db.center.y - a0.y * 20);
+      ctx.lineTo(db.center.x + a0.x * 20, db.center.y + a0.y * 20);
+      const a1 = db.axes[1];
+      ctx.moveTo(db.center.x - a1.x * 20, db.center.y - a1.y * 20);
+      ctx.lineTo(db.center.x + a1.x * 20, db.center.y + a1.y * 20);
+      ctx.stroke();
+
+      // --- draw perimeter samples (small blue dots) ---
+      if (db.perimeterSamples && db.perimeterSamples.length) {
+        ctx.save();
+        ctx.fillStyle = "deepskyblue";
+        for (const p of db.perimeterSamples) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 1.5, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+
+      // --- draw centerline samples (small blue dots, slightly darker) ---
+      if (db.centerlineSamples && db.centerlineSamples.length) {
+        ctx.save();
+        ctx.fillStyle = "dodgerblue";
+        for (const p of db.centerlineSamples) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 1.5, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+
+      ctx.restore();
+    });
+    try { ctx.globalAlpha = 1.0; } catch (e) {}
+  }
+
+  // ---------- external API ----------
+  function getVehicles() { return vehicles.slice(); }
+  function clear() { vehicles.length = 0; nextId = 1; }
+  function setTrafficConfig(obj) { trafficConfig = obj || trafficConfig; }
+  function setCanvasSize(sz) { if (sz?.width && sz?.height) { canvasSize.width = sz.width; canvasSize.height = sz.height; } }
+
+  function setLaneCoordinates(newLc) {
+    if (!newLc) return;
+    laneCoordinates.entry = newLc.entry || laneCoordinates.entry || {};
+    laneCoordinates.exit = newLc.exit || laneCoordinates.exit || {};
+    for (const v of vehicles) {
+      try { assignExitAndControlForVehicle(v); } catch (e) { console.warn("setLaneCoordinates: reassign failed untuk veh#", v.id, e); }
+    }
   }
 
   return {
     spawnRandomVehicle, scheduleNextSpawn, update, getVehicles, clear,
-    nextSpawnTimes, setTrafficConfig, setCanvasSize, drawDebugPoints, drawDebugPaths,
+    nextSpawnTimes, setTrafficConfig, setCanvasSize,
+    drawDebugPoints, drawDebugPaths, drawDebugBoxes,
     setLaneCoordinates
   };
 }
