@@ -590,6 +590,12 @@ function init() {
         baseSpeed: 0.10
     });
 
+        document.getElementById("resetBtn").addEventListener("click", () => {
+    if (vehController && typeof vehController.clearAllVehicles === "function") {
+        vehController.clearAllVehicles();
+    }
+    });
+
     // Immediately inform controller of computed laneCoordinates (drawLayout will populate laneCoordinates)
     drawLayout();
     if (typeof vehController.setLaneCoordinates === 'function') {
@@ -662,7 +668,22 @@ function init() {
             }
 
             drawVehicle(vctx, { x: 0, y: 0, type: vehicle.type });
-            vctx.restore();
+               // --- Gambar ID kendaraan di atasnya ---
+                if (vehicle.id) {
+                    vctx.fillStyle = "yellow";       // warna teks
+                    vctx.font = "bold 12px Arial";   // jenis font
+                    vctx.textAlign = "center";       // rata tengah
+                    vctx.textBaseline = "bottom";    // posisi di atas
+                    
+                    // sesuaikan tinggi label berdasarkan tipe kendaraan
+                    let offset = 6;
+                    if (vehicle.type === "truk") offset = 10;
+                    else if (vehicle.type === "mobil") offset = 8;
+
+                    vctx.fillText(vehicle.id, 0, -vehicle.lengthPx / 2 - 6);
+                    // ↑ teks muncul di atas kendaraan (6px di atas sisi atas)
+                }
+                 vctx.restore();
         });
 
         // 5) DRAW DEBUG visuals from controller: paths, points, boxes
@@ -692,25 +713,30 @@ function init() {
     });
 } // end init
 
+// Di dalam function animate(timestamp) { ... }
+const vehiclesFromCtrl = vehController.getVehicles();
 vehiclesFromCtrl.forEach(vehicle => {
-  vctx.save();
-  vctx.translate(vehicle.x, vehicle.y);
+    vctx.save();
+    vctx.translate(vehicle.x, vehicle.y);
 
-  // Rotasi arah
-  if (typeof vehicle.angle === "number") {
-    vctx.rotate(vehicle.angle);
-  }
+    if (typeof vehicle.angle === "number") {
+        vctx.rotate(vehicle.angle);
+    } else {
+        if (vehicle.direction === 'timur') vctx.rotate(-Math.PI / 2);
+        else if (vehicle.direction === 'barat') vctx.rotate(Math.PI / 2);
+        else if (vehicle.direction === 'utara') vctx.rotate(Math.PI);
+    }
 
-  // Gambar bentuk kendaraan
-  drawVehicle(vctx, { x: 0, y: 0, type: vehicle.type });
+    // Gambar kendaraan
+    drawVehicle(vctx, { x: 0, y: 0, type: vehicle.type });
 
-  // 🔹 Tambahkan ID di atas kendaraan
-  vctx.font = "11px Arial";
-  vctx.textAlign = "center";
-  vctx.fillStyle = "rgba(0,0,0,0.5)";
-  vctx.fillRect(-20, -vehicle.lengthPx / 2 - 18, 40, 14); // latar belakang teks
-  vctx.fillStyle = "white";
-  vctx.fillText(vehicle.id, 0, -vehicle.lengthPx / 2 - 8);
+    // 🔹 Gambar ID kendaraan di atasnya
+    if (vehicle.id) {
+        vctx.fillStyle = "yellow";
+        vctx.font = "bold 12px Arial";
+        vctx.textAlign = "center";
+        vctx.fillText(vehicle.id, 0, -20);
+    }
 
-  vctx.restore();
+    vctx.restore();
 });
