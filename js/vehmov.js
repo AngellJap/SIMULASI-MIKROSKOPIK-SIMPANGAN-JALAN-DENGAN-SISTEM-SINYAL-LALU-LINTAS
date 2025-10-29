@@ -16,13 +16,15 @@ export function createVehMovController(options = {}) {
   let trafficConfig = options.trafficConfig || {};
   const laneArrows = options.laneArrows || {};
   const canvasSize = options.canvasSize || { width: 800, height: 800 };
-
+  const cx = canvasSize.width / 2;
+  const cy = canvasSize.height / 2;
+  const centerRadius = 150; // area tengah simpang
   const ANGLE_ADJUST = Math.PI;
 
   const truckWheelbaseMeters = options.truckWheelbaseMeters ?? 5.8;
   const truckLengthMeters = options.truckLengthMeters ?? 12.0;
   const truckFrontOverhangMeters = options.truckFrontOverhangMeters ?? 1.0;
-  const truckRearOverhangMeters = options.truckRearOverhangMeters ?? 3.5;
+  const truckRearOverhangMeters = options.truckRearOverhangMeters ?? 0;
   const truckAxleSpacing = options.truckAxleSpacing || { frontToFirstRear: 5.8, firstRearToSecondRear: 1.3 };
 
   // debug box scale: default 1 => gunakan ukuran penuh kendaraan (1:1)
@@ -35,7 +37,7 @@ export function createVehMovController(options = {}) {
   const SPAWN_MARGIN = (typeof options.spawnMargin === 'number') ? options.spawnMargin : 200;
 
   // ---------- Laser config (dapat di-override via options) ----------
-  const LASER_LENGTH_PX = (typeof options.laserLengthPx === 'number') ? options.laserLengthPx : 60;
+  const LASER_LENGTH_PX = (typeof options.laserLengthPx === 'number') ? options.laserLengthPx : 30;
   const LASER_SAFE_STOP_PX = (typeof options.laserSafeStopPx === 'number') ? options.laserSafeStopPx : 15;
   const LASER_DRAW_ENABLED = (typeof options.laserDraw === 'boolean') ? options.laserDraw : true;
 
@@ -573,6 +575,7 @@ export function createVehMovController(options = {}) {
       v.turnTraveled = 0;
       v.approachingTurn = false;
       v.turning = true;
+      v.displayId = generateVehicleID(type, arah);
     }
 
     // initial debug box compute
@@ -582,38 +585,54 @@ export function createVehMovController(options = {}) {
     return v;
   }
 
-// 🔹 COUNTER ID per arah dan tipe kendaraan
-  const vehicleCounters = {
-    utara: { motor: 0, mobil: 0, truk: 0 },
-    timur: { motor: 0, mobil: 0, truk: 0 },
-    selatan: { motor: 0, mobil: 0, truk: 0 },
-    barat: { motor: 0, mobil: 0, truk: 0 }
-  };
+// =========================
+// PENOMORAN KENDARAAN
+// =========================
+const vehicleCounters = {
+  utara: { MC: 0, LV: 0, HV: 0 },
+  timur: { MC: 0, LV: 0, HV: 0 },
+  selatan: { MC: 0, LV: 0, HV: 0 },
+  barat: { MC: 0, LV: 0, HV: 0 },
+};
 
-  // 🔹 Fungsi pembuat ID kendaraan
-  function generateVehicleID(type, arah) {
-    const kodeArah = { utara: 'U', timur: 'T', selatan: 'S', barat: 'B' }[arah] || '';
-    const tipeKode = type === 'motor' ? 'MC' : type === 'mobil' ? 'LV' : 'HV';
-    vehicleCounters[arah][type]++;
-    const nomor = vehicleCounters[arah][type];
-    return `${tipeKode}${nomor}${kodeArah}`;
-  }
+// Fungsi bantu untuk membentuk ID unik
+function generateVehicleID(type, direction) {
+  let prefix;
+  if (type === 'motor') prefix = 'MC';
+  else if (type === 'mobil') prefix = 'LV';
+  else if (type === 'truk') prefix = 'HV';
+  else prefix = 'UK'; // unknown fallback
 
-  function spawnRandomVehicle(forcedDirection = null) {
-    const directions = ['utara', 'timur', 'selatan', 'barat'];
-    const arah = forcedDirection || directions[Math.floor(Math.random() * directions.length)];
-    const laneCount = (config[arah] && config[arah].in) ? config[arah].in : 0;
-    if (!laneCount) return null;
-    const truckPct = (trafficConfig[arah]?.truckPct ?? 20);
-    const rnd = Math.random() * 100;
-    let type = 'mobil';
-    if (rnd < truckPct) type = 'truk';
-    else if (rnd < truckPct + 30) type = 'motor';
-    const laneIndex = Math.floor(Math.random() * laneCount);
-    const outChoices = exitLaneNumbers[arah] || [];
-    const exitLane = outChoices.length > 0 ? outChoices[Math.floor(Math.random() * outChoices.length)] : null;
-    return createVehicle(arah, laneIndex, type, exitLane);
-  }
+  const dirLetter = direction === 'utara' ? 'U'
+                    : direction === 'timur' ? 'T'
+                    : direction === 'selatan' ? 'S'
+                    : direction === 'barat' ? 'B'
+                    : '?';
+
+  vehicleCounters[direction][prefix] += 1;
+  const num = vehicleCounters[direction][prefix];
+  return `${prefix}${num}${dirLetter}`;
+}
+
+function spawnRandomVehicle(forcedDirection = null) {
+  const directions = ['utara', 'timur', 'selatan', 'barat'];
+  const arah = forcedDirection || directions[Math.floor(Math.random() * directions.length)];
+  const laneCount = (config[arah] && config[arah].in) ? config[arah].in : 0;
+  if (!laneCount) return null;
+
+  const truckPct = (trafficConfig[arah]?.truckPct ?? 20);
+  const rnd = Math.random() * 100;
+  let type = 'mobil';
+  if (rnd < truckPct) type = 'truk';
+  else if (rnd < truckPct + 30) type = 'motor';
+
+  const laneIndex = Math.floor(Math.random() * laneCount);
+  const outChoices = exitLaneNumbers[arah] || [];
+  const exitLane = outChoices.length > 0 ? outChoices[Math.floor(Math.random() * outChoices.length)] : null;
+
+  const vehicle = createVehicle(arah, laneIndex, type, exitLane);
+  return vehicle;
+}
 
   function scheduleNextSpawn(arah, currentTimeMs) {
     const flow = (trafficConfig[arah]?.flow ?? 500);
@@ -908,6 +927,7 @@ export function createVehMovController(options = {}) {
       const reactionMs = (typeof v._reactionMs === 'number') ? v._reactionMs : DEFAULT_REACTION_MS;
       // baseSpeed may be passed in px/ms; if user used m/s, they must convert externally
       const baseSpeed = (typeof options.baseSpeed === 'number') ? options.baseSpeed : mps_to_px_per_ms(10); // default 10 m/s
+      const BOOST_FACTOR = 10; // percepatan ekstra di tengah simpang
 
       // detect vehicle ahead
       const ahead = findVehicleAhead(v);
@@ -1428,9 +1448,14 @@ export function createVehMovController(options = {}) {
       try { assignExitAndControlForVehicle(v); } catch (e) { console.warn("setLaneCoordinates: reassign failed untuk veh#", v.id, e); }
     }
   }
+  function clearAllVehicles() {
+    vehicles.length = 0;
+    nextId = 1;
+    console.log("Semua kendaraan telah dihapus.");
+  }
 
   return {
-    spawnRandomVehicle, scheduleNextSpawn, update, getVehicles, clear,
+    spawnRandomVehicle, scheduleNextSpawn, update, getVehicles, clear, clearAllVehicles,
     nextSpawnTimes, setTrafficConfig, setCanvasSize,
     drawDebugPoints, drawDebugPaths, drawDebugBoxes,
     setLaneCoordinates
