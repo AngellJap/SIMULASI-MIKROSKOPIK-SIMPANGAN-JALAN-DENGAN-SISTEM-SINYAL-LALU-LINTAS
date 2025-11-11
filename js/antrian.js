@@ -1,6 +1,7 @@
-// antrian.js (revisi: perbaikan bug kendaraan yang sudah melewati entry jadi rem saat kuning)
-// Penjelasan ringkas: tambahkan detection "passedEntry" (signed distance), dan commit-on-yellow
-// sehingga kendaraan yang sudah melewati mulut persimpangan/titik entry tidak akan direm kembali.
+// antrian.js (revisi lengkap — robust LTOR lookup untuk lajur outermost + IDM/overlap + commit-on-yellow + held TL cap + accel cap)
+// Catatan: updateAntrian signature kompatibel dengan main.js:
+// updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopLineCfg, laneArrows)
+// Keamanan: saya tidak menambahkan logging aktif kecuali pengecualian; jika mau debug, tambahkan console.debug di tempat yang diperlukan.
 
 const PX_PER_M = 10;
 const DEFAULT_VEHICLE_LENGTH_M = 4.5;
@@ -34,7 +35,6 @@ const YELLOW_COMMIT_DISTANCE_PX = YELLOW_COMMIT_DISTANCE_M * PX_PER_M;
 const YELLOW_TIME_MARGIN_MS = 300;
 const YELLOW_MIN_SPEED_FOR_TIME_CHECK = 0.00005;
 
-// helper time
 function nowMs() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
 
 function kmhToPxPerMs(kmh) {
@@ -60,6 +60,34 @@ function fallbackSetDesiredSpeedIfMissing(v) {
 }
 function projectPointOntoAxis(p, ax, ay) { return p.x * ax + p.y * ay; }
 function normalizeVec(v) { const L = Math.hypot(v.x, v.y); if (L <= 1e-9) return { x: 1, y: 0 }; return { x: v.x / L, y: v.y / L }; }
+
+// prefer leader axis (robust for queues)
+function choosePathTangentAxis(follower, leader) {
+  if (leader?.debugBox?.centerlineSamples?.length >= 2) {
+    const cl = leader.debugBox.centerlineSamples;
+    const a = cl[0], b = cl[cl.length - 1];
+    return normalizeVec({ x: b.x - a.x, y: b.y - a.y });
+  }
+  if (follower?.debugBox?.centerlineSamples?.length >= 2) {
+    const cl = follower.debugBox.centerlineSamples;
+    const a = cl[0], b = cl[cl.length - 1];
+    return normalizeVec({ x: b.x - a.x, y: b.y - a.y });
+  }
+  if (leader?.debugBox && typeof leader.debugBox.angle === 'number') {
+    const ang = leader.debugBox.angle;
+    return { x: Math.cos(ang), y: Math.sin(ang) };
+  }
+  if (follower?.debugBox && typeof follower.debugBox.angle === 'number') {
+    const ang = follower.debugBox.angle;
+    return { x: Math.cos(ang), y: Math.sin(ang) };
+  }
+  if (follower?.debugBox && leader?.debugBox) {
+    const dx = leader.debugBox.center.x - follower.debugBox.center.x;
+    const dy = leader.debugBox.center.y - follower.debugBox.center.y;
+    return normalizeVec({ x: dx, y: dy });
+  }
+  return { x: 1, y: 0 };
+}
 
 function buildCenterlineSamples(v, n = 9) {
   if (!v || !v.debugBox) return null;
@@ -109,11 +137,18 @@ function buildPerimeterSamples(v, samplesPerEdge = 8) {
   return pts;
 }
 function ensureSamplesForVehicle(v, opts = {}) {
-  if (!v || !v.debugBox) return;
-  const nCenter = opts.centerSamples || 9;
-  const perEdge = opts.perEdge || 8;
-  buildCenterlineSamples(v, nCenter);
-  buildPerimeterSamples(v, perEdge);
+  if (!v) return;
+  if (v.debugBox) {
+    const nCenter = opts.centerSamples || 9;
+    const perEdge = opts.perEdge || 8;
+    buildCenterlineSamples(v, nCenter);
+    buildPerimeterSamples(v, perEdge);
+  } else {
+    if (typeof v.frontX === 'number' && typeof v.frontY === 'number' && typeof v.rearX === 'number' && typeof v.rearY === 'number') {
+      v.debugBox = v.debugBox || { center: { x: (v.frontX + v.rearX) * 0.5, y: (v.frontY + v.rearY) * 0.5 }, corners: [], angle: Math.atan2(v.frontY - v.rearY, v.frontX - v.rearX) };
+      buildCenterlineSamples(v, opts.centerSamples || 9);
+    }
+  }
 }
 function obbOverlapSAT(dbA, dbB) {
   if (!dbA || !dbB || !Array.isArray(dbA.corners) || !Array.isArray(dbB.corners)) return false;
@@ -152,10 +187,14 @@ function shiftedDebugBox(db, dx, dy) {
   const corners = db.corners.map(p => ({ x: p.x + dx, y: p.y + dy }));
   return { corners, center: { x: db.center.x + dx, y: db.center.y + dy }, angle: db.angle, halfExtents: db.halfExtents };
 }
+
+// computeMaxNonOverlapScale using path tangent axis (avoid stale vx/vy)
 function computeMaxNonOverlapScale(follower, leader, dt) {
   if (!follower || !leader || !follower.debugBox || !leader.debugBox) return 1.0;
-  const fMove = { x: (follower.vx || 0) * follower.speed * dt, y: (follower.vy || 0) * follower.speed * dt };
-  const lMove = { x: (leader.vx || 0) * leader.speed * dt, y: (leader.vy || 0) * leader.speed * dt };
+
+  const axis = choosePathTangentAxis(follower, leader);
+  const fMove = { x: axis.x * (follower.speed || 0) * dt, y: axis.y * (follower.speed || 0) * dt };
+  const lMove = { x: axis.x * (leader.speed || 0) * dt, y: axis.y * (leader.speed || 0) * dt };
 
   const fFull = shiftedDebugBox(follower.debugBox, fMove.x, fMove.y);
   const lFull = shiftedDebugBox(leader.debugBox, lMove.x, lMove.y);
@@ -164,7 +203,7 @@ function computeMaxNonOverlapScale(follower, leader, dt) {
   if (obbOverlapSAT(follower.debugBox, leader.debugBox)) return 0.0;
 
   let lo = 0.0, hi = 1.0, best = 0.0;
-  for (let iter = 0; iter < 22; iter++) {
+  for (let iter = 0; iter < 24; iter++) {
     const mid = (lo + hi) / 2;
     const fMid = shiftedDebugBox(follower.debugBox, fMove.x * mid, fMove.y * mid);
     const lMid = shiftedDebugBox(leader.debugBox, lMove.x * mid, lMove.y * mid);
@@ -174,87 +213,112 @@ function computeMaxNonOverlapScale(follower, leader, dt) {
     } else {
       hi = mid;
     }
-    if (hi - lo < 1e-4) break;
+    if (hi - lo < 1e-5) break;
   }
   return Math.max(0, Math.min(1, best));
 }
+
+// --- REVISED computeLongitudinalGapUsingSamples: robust terhadap tikungan radius kecil
 function computeLongitudinalGapUsingSamples(follower, leader) {
   if (!follower) return 1e9;
-  let axisAngle = null;
-  if (follower.debugBox && typeof follower.debugBox.angle === 'number') axisAngle = follower.debugBox.angle;
-  else if (typeof follower.frontX === 'number' && typeof follower.rearX === 'number') {
-    const dx = follower.frontX - follower.rearX, dy = follower.frontY - follower.rearY;
-    axisAngle = Math.atan2(dy, dx);
-  } else axisAngle = 0;
-  const ax = Math.cos(axisAngle), ay = Math.sin(axisAngle);
+  if (!leader) return 1e9;
 
-  const fCL = (follower.debugBox && Array.isArray(follower.debugBox.centerlineSamples)) ? follower.debugBox.centerlineSamples : (buildCenterlineSamples(follower, 9) || null);
-  const lCL = (leader && leader.debugBox && Array.isArray(leader.debugBox.centerlineSamples)) ? leader.debugBox.centerlineSamples : (leader ? buildCenterlineSamples(leader, 9) : null);
+  const PREDICTION_TIME_MS = 120;
+  const ANGLE_CLEARANCE_THRESHOLD = (30 * Math.PI / 180);
+  const PATH_PROGRESS_CLEAR_THRESHOLD = 0.85;
+  const LARGE_GAP = 1e6;
+
+  const fAngle = (typeof follower.tangentAngle === 'number') ? follower.tangentAngle : (follower.debugBox && typeof follower.debugBox.angle === 'number' ? follower.debugBox.angle : null);
+  const lAngle = (typeof leader.tangentAngle === 'number') ? leader.tangentAngle : (leader.debugBox && typeof leader.debugBox.angle === 'number' ? leader.debugBox.angle : null);
+
+  const axis = choosePathTangentAxis(follower, leader);
+  const ax = axis.x, ay = axis.y;
+  const axisLen = Math.hypot(ax, ay) || 1;
+  const nx = ax / axisLen, ny = ay / axisLen;
+
+  const leaderProgress = (typeof leader.pathProgress === 'number') ? leader.pathProgress : null;
+  if (leaderProgress !== null && leaderProgress >= PATH_PROGRESS_CLEAR_THRESHOLD) {
+    return LARGE_GAP;
+  }
+
+  let angleDiff = 0;
+  if (fAngle !== null && lAngle !== null) {
+    angleDiff = Math.abs(Math.atan2(Math.sin(lAngle - fAngle), Math.cos(lAngle - fAngle)));
+  }
+
+  const projectAll = (pts) => {
+    if (!Array.isArray(pts) || pts.length === 0) return null;
+    let mn = Infinity, mx = -Infinity;
+    for (const p of pts) {
+      const pr = p.x * nx + p.y * ny;
+      if (pr < mn) mn = pr;
+      if (pr > mx) mx = pr;
+    }
+    return { min: mn, max: mx };
+  };
+
+  const fCL = (follower.debugBox && Array.isArray(follower.debugBox.centerlineSamples)) ? follower.debugBox.centerlineSamples : (buildCenterlineSamples(follower, 11) || null);
+  const lCL = (leader.debugBox && Array.isArray(leader.debugBox.centerlineSamples)) ? leader.debugBox.centerlineSamples : (buildCenterlineSamples(leader, 11) || null);
+
+  let followerFrontProj = null;
+  let leaderRearProj = null;
 
   if (fCL && lCL) {
-    let frontProj = -Infinity;
-    for (const p of fCL) {
-      const pr = projectPointOntoAxis(p, ax, ay);
-      if (pr > frontProj) frontProj = pr;
+    const pf = projectAll(fCL);
+    const pl = projectAll(lCL);
+    if (pf && pl) {
+      followerFrontProj = pf.max;
+      leaderRearProj = pl.min;
     }
-    let rearProj = Infinity;
-    for (const p of lCL) {
-      const pr = projectPointOntoAxis(p, ax, ay);
-      if (pr < rearProj) rearProj = pr;
-    }
-    return rearProj - frontProj;
   }
 
-  const fPer = (follower.debugBox && Array.isArray(follower.debugBox.perimeterSamples)) ? follower.debugBox.perimeterSamples : (buildPerimeterSamples(follower, 8) || null);
-  const lPer = (leader && leader.debugBox && Array.isArray(leader.debugBox.perimeterSamples)) ? leader.debugBox.perimeterSamples : (leader ? buildPerimeterSamples(leader, 8) : null);
+  if ((followerFrontProj === null || leaderRearProj === null) && follower.debugBox && leader.debugBox) {
+    const fPer = (Array.isArray(follower.debugBox.perimeterSamples)) ? follower.debugBox.perimeterSamples : buildPerimeterSamples(follower, 10);
+    const lPer = (Array.isArray(leader.debugBox.perimeterSamples)) ? leader.debugBox.perimeterSamples : buildPerimeterSamples(leader, 10);
 
-  if (fPer && lPer) {
-    const centerProj = projectPointOntoAxis(follower.debugBox.center, ax, ay);
-    let frontProj = -Infinity;
-    for (const p of fPer) {
-      const pr = projectPointOntoAxis(p, ax, ay);
-      if (pr >= centerProj && pr > frontProj) frontProj = pr;
-    }
-    if (!isFinite(frontProj) || frontProj === -Infinity) {
-      for (const p of fPer) {
-        const pr = projectPointOntoAxis(p, ax, ay);
-        if (pr > frontProj) frontProj = pr;
+    if (fPer && lPer) {
+      const pf = projectAll(fPer);
+      const pl = projectAll(lPer);
+      if (pf && pl) {
+        followerFrontProj = followerFrontProj === null ? pf.max : Math.max(followerFrontProj, pf.max);
+        leaderRearProj = leaderRearProj === null ? pl.min : Math.min(leaderRearProj, pl.min);
       }
     }
-
-    const leaderCenterProj = projectPointOntoAxis(leader.debugBox.center, ax, ay);
-    let rearProj = Infinity;
-    for (const p of lPer) {
-      const pr = projectPointOntoAxis(p, ax, ay);
-      if (pr <= leaderCenterProj && pr < rearProj) rearProj = pr;
-    }
-    if (!isFinite(rearProj) || rearProj === Infinity) {
-      for (const p of lPer) {
-        const pr = projectPointOntoAxis(p, ax, ay);
-        if (pr < rearProj) rearProj = pr;
-      }
-    }
-
-    return rearProj - frontProj;
   }
 
-  if (follower && leader) {
+  if ((followerFrontProj === null || leaderRearProj === null)) {
     const fFront = (typeof follower.frontX === 'number' && typeof follower.frontY === 'number') ? { x: follower.frontX, y: follower.frontY } : null;
-    const lRear = (typeof leader.rearX === 'number' && typeof leader.rearY === 'number') ? { x: leader.rearX, y: leader.rearY } : null;
-    if (fFront && lRear) {
-      const pf = projectPointOntoAxis(fFront, ax, ay);
-      const pl = projectPointOntoAxis(lRear, ax, ay);
-      return pl - pf;
-    }
+    const lRear  = (typeof leader.rearX === 'number' && typeof leader.rearY === 'number') ? { x: leader.rearX, y: leader.rearY } : null;
+    if (fFront) followerFrontProj = projectPointOntoAxis(fFront, nx, ny);
+    if (lRear) leaderRearProj = projectPointOntoAxis(lRear, nx, ny);
   }
 
-  if (follower && leader) {
-    const raw = Math.hypot(leader.debugBox ? (leader.debugBox.center.x - follower.debugBox.center.x) : (leader.x - follower.x),
-                           leader.debugBox ? (leader.debugBox.center.y - follower.debugBox.center.y) : (leader.y - follower.y));
-    return Math.max(-1e6, raw - vehicleLengthPx(leader));
+  if (followerFrontProj === null || leaderRearProj === null) {
+    if (follower.debugBox && leader.debugBox && follower.debugBox.center && leader.debugBox.center) {
+      const raw = Math.hypot(leader.debugBox.center.x - follower.debugBox.center.x, leader.debugBox.center.y - follower.debugBox.center.y);
+      return Math.max(-1e6, raw - vehicleLengthPx(leader));
+    }
+    return 1e9;
   }
-  return 1e9;
+
+  const leaderSpeed = (typeof leader.speed === 'number') ? leader.speed : 0;
+  const leaderRearPredicted = leaderRearProj + leaderSpeed * PREDICTION_TIME_MS;
+
+  let rawGap = leaderRearPredicted - followerFrontProj;
+
+  if (angleDiff > ANGLE_CLEARANCE_THRESHOLD) {
+    const factor = Math.min(1.0, angleDiff / Math.PI);
+    const relaxPx = Math.max(20, 60 * factor);
+    rawGap += relaxPx;
+  }
+
+  if (leaderProgress !== null && leaderProgress > (PATH_PROGRESS_CLEAR_THRESHOLD - 0.15)) {
+    rawGap += 40;
+  }
+
+  return rawGap;
 }
+
 function raySegmentIntersect(s, rd, a, sd) {
   const cross = (u, v) => u.x * v.y - u.y * v.x;
   const denom = cross(rd, sd);
@@ -292,49 +356,194 @@ function getVehicleRearPoint(v) {
     const ry = v.debugBox.center.y - Math.sin(heading) * len;
     return { x: rx, y: ry };
   }
-  // fallback: center
   if (v.debugBox && v.debugBox.center) return { x: v.debugBox.center.x, y: v.debugBox.center.y };
   if (typeof v.x === 'number' && typeof v.y === 'number') return { x: v.x, y: v.y };
   return null;
 }
 
-// --- helper: compute signed distance along vehicle heading from front to entry
 function signedDistFrontToEntryAlongHeading(v, entry) {
   const front = getVehicleFrontPoint(v);
   if (!front) return null;
-  // heading vector: from rear to front if available or from debugBox.angle
   let heading = null;
   if (v.debugBox && typeof v.debugBox.angle === 'number') {
     heading = { x: Math.cos(v.debugBox.angle), y: Math.sin(v.debugBox.angle) };
   } else if (Array.isArray(v.debugBox?.centerlineSamples) && v.debugBox.centerlineSamples.length >= 2) {
     const cl = v.debugBox.centerlineSamples;
-    const a = cl[cl.length - 1];
-    const b = cl[0];
-    heading = normalizeVec({ x: a.x - b.x, y: a.y - b.y });
+    heading = normalizeVec({ x: cl[cl.length - 1].x - cl[0].x, y: cl[cl.length - 1].y - cl[0].y });
   } else if (typeof v.frontX === 'number' && typeof v.rearX === 'number') {
     heading = normalizeVec({ x: v.frontX - v.rearX, y: v.frontY - v.rearY });
   } else {
-    // fallback to vector from front -> entry (absolute dist, not signed)
     const dx = entry.x - front.x, dy = entry.y - front.y;
     return Math.hypot(dx, dy);
   }
   const dx = entry.x - front.x, dy = entry.y - front.y;
-  return dx * heading.x + dy * heading.y; // positive if entry is ahead along heading, negative if front passed entry
+  return dx * heading.x + dy * heading.y;
+}
+
+// ----------------- Robust laneArrow lookup helper -----------------
+// Tries multiple heuristics to find the arrow value for (direction, laneIndex).
+function lookupLaneArrowValue(laneArrows, direction, laneIndex) {
+  if (!laneArrows) return null;
+  const tryKeys = [direction, String(direction), direction?.toLowerCase?.(), direction?.toUpperCase?.()].filter(Boolean);
+  let arr = null;
+  for (const k of tryKeys) {
+    if (laneArrows[k] != null) { arr = laneArrows[k]; break; }
+  }
+  if (arr == null) {
+    if (laneArrows.lanes && laneArrows.lanes[direction]) arr = laneArrows.lanes[direction];
+    else if (laneArrows.arrowMap && laneArrows.arrowMap[direction]) arr = laneArrows.arrowMap[direction];
+  }
+  if (arr == null) return null;
+
+  const idx = (typeof laneIndex === 'number' && Number.isFinite(laneIndex)) ? Math.floor(laneIndex) : null;
+
+  if (Array.isArray(arr)) {
+    const candidates = [];
+    if (idx !== null) {
+      candidates.push(idx);                       // 0-based
+      candidates.push(idx - 1);                   // laneIndex may be 1-based
+      candidates.push(idx + 1);                   // offset variant
+      candidates.push(arr.length - 1 - idx);      // reversed order
+      candidates.push(arr.length - idx);          // reversed + 1-based
+      candidates.push(arr.length - 1 - (idx - 1));
+    }
+    candidates.push(0); candidates.push(arr.length - 1);
+    for (const c of candidates) {
+      if (typeof c === 'number' && c >= 0 && c < arr.length) {
+        const val = arr[c];
+        if (val != null) return val;
+      }
+    }
+    const keyStrs = [String(idx), String(idx + 1), String(idx - 1)];
+    for (const ks of keyStrs) { if (arr[ks] != null) return arr[ks]; }
+    return null;
+  }
+
+  if (typeof arr === 'object') {
+    const keys = [];
+    if (idx !== null) { keys.push(String(idx), String(idx + 1), String(idx - 1)); }
+    keys.push('0', '1');
+    for (const k of keys) { if (arr[k] != null) return arr[k]; }
+    if (typeof arr === 'string') return arr;
+    for (const k in arr) { if (arr[k] != null) return arr[k]; }
+    return null;
+  }
+
+  return arr;
+}
+
+// ---------------- MERGING UTILITIES ----------------
+// letakkan ini di atas (sebelum export function updateAntrian)
+function allowedLeftForActive(activeDir) {
+  // bila activeDir = arah yang sedang hijau (utara/timur/selatan/barat)
+  // return arah yang DIIZINKAN untuk belok kiri ketika merging = No & LTOR aktif
+  const map = {
+    utara: 'barat',   // utara hijau -> barat boleh belok kiri
+    timur: 'utara',   // timur hijau -> utara boleh belok kiri
+    selatan: 'timur', // selatan hijau -> timur boleh belok kiri
+    barat: 'selatan'  // barat hijau -> selatan boleh belok kiri
+  };
+  return map[activeDir] || null;
+}
+
+/**
+ * hasMergingConflict
+ * - currentDir: arah kendaraan (utara/timur/selatan/barat)
+ * - movement: 'left'|'straight'|'right' (string)
+ * - lampuObj: referensi object lampu (instance LampuLaluLintas) — untuk baca fase aktif
+ * - cfg: config / stopLineCfg yang berisi merging (true/false) dan ltsorGlobal (LTOR)
+ *
+ * return true jika KONFLIK (=> harus diblok / berhenti)
+ */
+function hasMergingConflict(currentDir, movement, lampuObj, cfg = {}) {
+  try {
+    // Jika merging diizinkan global => tidak ada konflik
+    if (cfg.merging !== false) return false;
+
+    // Jika bukan belok kiri, tidak ada konflik merging
+    if (!movement || movement !== 'left') return false;
+
+    // Hanya relevan jika LTOR aktif
+    const ltorActive = !!(cfg.ltsorGlobal || cfg.ltsor || cfg.ltor);
+    if (!ltorActive) return false;
+
+    // --- Tentukan arah aktif (lampu hijau) ---
+    let activeDir = null;
+    if (lampuObj) {
+      if (Array.isArray(lampuObj.urutan) && typeof lampuObj.indexAktif === 'number') {
+        activeDir = lampuObj.urutan[lampuObj.indexAktif];
+      }
+      if (!activeDir && lampuObj.currentDirection) activeDir = lampuObj.currentDirection;
+      if (!activeDir && lampuObj.status) {
+        for (const k of ['utara','timur','selatan','barat']) {
+          if (lampuObj.status[k] === 'hijau') { activeDir = k; break; }
+        }
+      }
+    }
+    if (!activeDir) return false;
+
+    // --- Aturan Merging=No (fase searah) ---
+    const allowedLeftTurn = {
+      utara: 'barat',   // utara hijau → barat boleh belok kiri
+      timur: 'utara',   // timur hijau → utara boleh belok kiri
+      selatan: 'timur', // selatan hijau → timur boleh belok kiri
+      barat: 'selatan'  // barat hijau → selatan boleh belok kiri
+    };
+
+    const allowed = allowedLeftTurn[activeDir];
+    if (!allowed) return false;
+
+    // Jika kendaraan bukan dari arah yang diizinkan, block (konflik)
+    if (currentDir !== allowed) return true;
+
+    return false;
+  } catch (e) {
+    console.warn("hasMergingConflict error:", e);
+    return false;
+  }
 }
 
 // ----------------- MAIN updateAntrian -----------------
-export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopLineCfg) {
+export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopLineCfg, laneArrows) {
   if (!vehicles || vehicles.length === 0) return;
   if (deltaTime <= 0) return;
 
   const now = nowMs();
 
+  // detect LTOR global flag (support several possible names)
+  const ltorActive = !!(stopLineCfg && (stopLineCfg.ltsorGlobal || stopLineCfg.ltsor || stopLineCfg.ltor));
+
+// === MERGING LOGIC FIXED ===
+// Tentukan arah keluar untuk tiap pergerakan dari tiap lengan
+function getExitFor(dir, movement) {
+  const map = {
+    utara: { left: 'barat', straight: 'selatan', right: 'timur' },
+    timur: { left: 'utara', straight: 'barat', right: 'selatan' },
+    selatan: { left: 'timur', straight: 'utara', right: 'barat' },
+    barat: { left: 'selatan', straight: 'timur', right: 'utara' },
+  };
+  return map[dir]?.[movement] || null;
+}
+
   // prepare vehicles
   for (const v of vehicles) {
+    if (!v) continue;
     fallbackSetDesiredSpeedIfMissing(v);
     v._idm = v._idm || {};
-    if (!v.debugBox) continue;
-    ensureSamplesForVehicle(v, { centerSamples: 9, perEdge: 10 });
+    v._idm.provisionalSpeed = undefined;
+    v._idm.tlAllowedSpeed = undefined;
+    v._idm.tlEnforced = false;
+    v._idm.laserAllowedSpeed = undefined;
+    v._idm.overlapAllowedSpeed = undefined;
+    v._idm.overlapScale = 1.0;
+    v._idm.overlapCandidateId = null;
+    v._idm.laser = v._idm.laser || { hit: false, hits: [] };
+    ensureSamplesForVehicle(v, { centerSamples: 11, perEdge: 10 });
+  }
+
+  for (const v of vehicles) {
+    if (!v || !v.debugBox) continue;
+    ensureSamplesForVehicle(v, { centerSamples: 11, perEdge: 10 });
   }
 
   // lane grouping
@@ -401,11 +610,10 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
         let maxMoveAllowed = Math.max(0, gap + leaderMove - SAFETY_BUFFER_PX);
         if (gap <= 0) maxMoveAllowed = 0;
         const maxAllowedSpeed = (deltaTime > 0) ? (maxMoveAllowed / deltaTime) : cappedSpeed;
-        const EPS_MIN_SPEED = 1e-8;
-        let finalAllowedSpeed = Math.max(0, Math.max(EPS_MIN_SPEED, Math.min(cappedSpeed, maxAllowedSpeed)));
+        let finalAllowedSpeed = Math.max(0, Math.min(cappedSpeed, maxAllowedSpeed));
         if (gap <= SAFETY_BUFFER_PX * 0.5) finalAllowedSpeed = 0;
 
-        veh._idm = veh._idm || {};
+        // diagnostics
         veh._idm.acc = acc;
         veh._idm.gap = gap;
         veh._idm.s_star = s_star;
@@ -420,12 +628,45 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
         veh._idm.cappedSpeed = cappedSpeed;
         veh._idm.finalAllowedSpeed = finalAllowedSpeed;
 
-        veh.speed = finalAllowedSpeed;
+        veh._idm.provisionalSpeed = finalAllowedSpeed;
+
+// ---------------- CEK MERGING (letakkan tepat di bawah provisionalSpeed assignment) ----------------
+try {
+  // pastikan kita punya info a
+  // rah & gerakan kendaraan
+  const currentDir = veh.direction || veh.entryDir;
+  const movement = (veh.movement || veh.route || 'left').toString().toLowerCase();
+
+  // pass lampu instance dan config (stopLineCfg yang diteruskan dari main.js ke updateAntrian)
+  // di file ini nama param biasanya stopLineCfg — jika beda, sesuaikan
+  const lampuObj = lampu; // variable lampu harus tersedia di scope updateAntrian
+  const cfg = stopLineCfg || {}; // stopLineCfg diteruskan saat updateAntrian(..., stopLineCfg, ...)
+
+  // Jika ada konflik merging dan kendaraan BELUM melewati entry (stopline),
+  // maka perlakukan seperti "diblok" (set allowed speed 0 & tandai enforcement)
+  if (hasMergingConflict(currentDir, movement, lampuObj, cfg)) {
+    // hanya block bila kendaraan belum melewati stopline (kita gunakan flag trafficLight.passedEntry)
+    const passedEntry = !!(veh._idm.trafficLight && veh._idm.trafficLight.passedEntry);
+    if (!passedEntry) {
+      veh._idm.tlAllowedSpeed = 0;
+      veh._idm.tlEnforced = true;
+      veh.speed = 0;
+      veh._idm.trafficLight = veh._idm.trafficLight || {};
+      veh._idm.trafficLight.reason = 'merge_blocked';
+      veh._idm._mergeBlocked = true;
+      // pastikan kita tidak melanjutkan pergerakan untuk kendaraan ini di frame ini
+      veh._idm.finalAllowedSpeed = 0;
+      continue; // lewati sisa update untuk veh ini
+    }
+  }
+} catch (e) {
+  console.warn("merge-check runtime error:", e);
+}
       }
     }
   }
 
-  // ----------------- TRAFFIC LIGHT ENFORCEMENT (fix: passedEntry + commit-on-yellow) -----------------
+  // ----------------- TRAFFIC LIGHT ENFORCEMENT (passedEntry + commit-on-yellow + held cap) -----------------
   try {
     if (lampu && laneCoordinates && laneCoordinates.entry) {
 
@@ -440,67 +681,104 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
 
       for (const v of vehicles) {
         if (!v || !v.direction || typeof v.laneIndex !== 'number') continue;
-
         v._idm = v._idm || {};
         v._idm.trafficLight = v._idm.trafficLight || {};
 
+        if (typeof v._idm._heldTlAllowed === 'undefined') v._idm._heldTlAllowed = undefined;
+
         if (v.createdAt && (now - v.createdAt) < SPAWN_GRACE_MS) {
           v._idm.trafficLight.skipped = true;
+          v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
+          v._idm.tlEnforced = false;
+          v._idm._heldTlAllowed = undefined;
           continue;
         }
 
         const entryKey = `${v.direction}_${v.laneIndex}`;
         const entry = laneCoordinates.entry ? laneCoordinates.entry[entryKey] : null;
-        if (!entry) continue;
+        if (!entry) {
+          v._idm._heldTlAllowed = undefined;
+          v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
+          v._idm.tlEnforced = false;
+          v._idm.trafficLight.stopMode = undefined;
+          continue;
+        }
 
         const signedDist = signedDistFrontToEntryAlongHeading(v, entry);
-        // store signedDist for debug
         v._idm.trafficLight.signedFrontToEntry = signedDist;
-
-        // determine passedEntry by signed dist (<= 0 means front at/after entry)
         const passedEntry = (signedDist != null && signedDist <= 0);
         v._idm.trafficLight.passedEntry = !!passedEntry;
 
-        // if previously committed on yellow, check if rear has cleared entry to release commit
         if (v._idm.trafficLight.committedOnYellow) {
           const rear = getVehicleRearPoint(v);
           if (rear) {
-            // compute signed rear->entry along same heading (approx by projecting vector onto heading built from debugBox.angle/rear->front)
-            // reuse signedDistFrontToEntry but for rear: build temp obj with front=rear & rear move slightly backwards not necessary; approximate by computing vector along v.debugBox.angle
             let heading = null;
             if (v.debugBox && typeof v.debugBox.angle === 'number') {
               heading = { x: Math.cos(v.debugBox.angle), y: Math.sin(v.debugBox.angle) };
             } else if (Array.isArray(v.debugBox?.centerlineSamples) && v.debugBox.centerlineSamples.length >= 2) {
               const cl = v.debugBox.centerlineSamples;
               heading = normalizeVec({ x: cl[cl.length - 1].x - cl[0].x, y: cl[cl.length - 1].y - cl[0].y });
-            } else {
-              heading = null;
             }
             if (heading) {
               const dxr = entry.x - rear.x, dyr = entry.y - rear.y;
               const signedRear = dxr * heading.x + dyr * heading.y;
-              // once rear has passed (signedRear <= 0), release committedOnYellow
               if (signedRear <= 0) {
                 v._idm.trafficLight.committedOnYellow = false;
                 v._idm.trafficLight.committedReleasedAt = now;
+                v._idm._heldTlAllowed = undefined;
               }
             }
           }
         }
 
-        // if passedEntry or currently committed => do not enforce TL stop
+        const light = (lampu && lampu.status) ? lampu.status[v.direction] : null;
+
+        if (light === 'merah' && v._idm.trafficLight.committedOnYellow && !v._idm.trafficLight.passedEntry) {
+          v._idm.trafficLight.committedOnYellow = false;
+          v._idm.trafficLight.committedRevokedAt = now;
+        }
+
         if (v._idm.trafficLight.passedEntry || v._idm.trafficLight.committedOnYellow) {
           v._idm.trafficLight.enforced = false;
           v._idm.trafficLight.reason = v._idm.trafficLight.passedEntry ? 'already_past_entry' : 'committed_on_yellow';
+          v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
+          v._idm.tlEnforced = false;
+          if (v._idm.trafficLight.passedEntry) v._idm._heldTlAllowed = undefined;
           continue;
         }
 
-        // otherwise normal TL reaction if within lookahead
         const front = getVehicleFrontPoint(v);
-        if (!front) continue;
+        if (!front) {
+          v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
+          v._idm.tlEnforced = false;
+          continue;
+        }
         const dx = entry.x - front.x, dy = entry.y - front.y;
         const dist = Math.hypot(dx, dy);
         v._idm.trafficLight.frontDist = dist;
+
+        // ---------- LTOR bypass (robust lookup) ----------
+        v._idm.trafficLight.ltorMatch = null;
+        try {
+          const laneArrowRaw = lookupLaneArrowValue(laneArrows, v.direction, v.laneIndex);
+          const laneArrowNorm = (typeof laneArrowRaw === 'string') ? laneArrowRaw.toLowerCase() : null;
+          const isExactLeft = laneArrowNorm === 'left' || laneArrowNorm === 'left-only';
+          const isContainsLeft = (!isExactLeft && laneArrowNorm && laneArrowNorm.includes('left'));
+          if (ltorActive && (isExactLeft || isContainsLeft) && (v.route === 'left' || v._forceLeft)) {
+            // Bypass TL for left-turn-only lane vehicle
+            v._idm.trafficLight.enforced = false;
+            v._idm.trafficLight.reason = 'ltor_bypass';
+            v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
+            v._idm.tlEnforced = false;
+            v._idm.trafficLight.ltorMatch = isExactLeft ? 'exact' : 'contains';
+            // Clear held TL cap so it won't block motion
+            v._idm._heldTlAllowed = undefined;
+            continue;
+          }
+        } catch (e) {
+          // ignore lookup errors, fallback to TL normal behavior
+        }
+        // ---------- end LTOR ----------
 
         if (dist <= STOP_LOOKAHEAD_PX) {
           const stoppingDist = Math.max(0, dist - LASER_SAFE_STOP_PX - SAFETY_BUFFER_PX);
@@ -515,13 +793,14 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
           let allowedFromTL = Math.min(allowedByDecel, allowedByMove, desiredRampSpeed);
           if (stoppingDist <= SAFETY_BUFFER_PX * 0.5) allowedFromTL = 0;
 
-          const light = (lampu && lampu.status) ? lampu.status[v.direction] : null;
-          if (!light) continue;
+          if (!light) {
+            v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
+            v._idm.tlEnforced = false;
+            continue;
+          }
 
           if (light === 'kuning') {
-            // Decide commit-or-stop
             const withinCommitDistance = dist <= YELLOW_COMMIT_DISTANCE_PX;
-
             const timeLeft = getYellowTimeLeftMs(lampu, v.direction); // ms or null
             let canReachBeforeEnd = false;
             const currentSpeed = (typeof v.speed === 'number') ? v.speed : ((typeof v._idm.v === 'number') ? v._idm.v : 0);
@@ -535,92 +814,107 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
             }
 
             if (withinCommitDistance || canReachBeforeEnd) {
-              // Commit: allow vehicle to continue. Mark committedOnYellow to prevent future TL enforcement
               v._idm.trafficLight.committedOnYellow = true;
               v._idm.trafficLight.enforced = false;
+              v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
+              v._idm.tlEnforced = false;
               v._idm.trafficLight.yellowCommit = true;
               v._idm.trafficLight.reason = withinCommitDistance ? 'yellow_commit_close' : 'yellow_commit_time';
-              // leave v.speed as IDM provisional
+              v._idm._heldTlAllowed = undefined;
             } else {
-              // Stop as before
               v._idm.trafficLight.enforced = true;
               v._idm.trafficLight.allowed = allowedFromTL;
-              v._idm.trafficLight.desiredRampSpeed = desiredRampSpeed;
-              v._idm.trafficLight.allowedByDecel = allowedByDecel;
-              v._idm.trafficLight.allowedByMove = allowedByMove;
-              v._idm.trafficLight.stoppingDist = stoppingDist;
-              v._idm.trafficLight.rampFactor = rampFactorRaw;
-
-              const currentV = (typeof v._idm.v === 'number') ? v._idm.v : (typeof v.speed === 'number' ? v.speed : 0);
-              const intended = (typeof v.speed === 'number') ? v.speed : 0;
-              const targetAfterTL = Math.min(intended, allowedFromTL);
-              const maxDecelPerFrame = safeDecel * deltaTime;
-              let newSpeed;
-              if (targetAfterTL < currentV - maxDecelPerFrame) newSpeed = Math.max(0, currentV - maxDecelPerFrame);
-              else newSpeed = Math.max(0, targetAfterTL);
-              v.speed = Math.min(v.speed || newSpeed, newSpeed);
-              if (allowedFromTL === 0) v.speed = 0;
+              v._idm.tlAllowedSpeed = allowedFromTL;
+              v._idm.tlEnforced = true;
               v._idm.trafficLight.reason = 'stop_on_yellow';
+              if (typeof v._idm._heldTlAllowed !== 'number') v._idm._heldTlAllowed = allowedFromTL;
+              else v._idm._heldTlAllowed = Math.min(v._idm._heldTlAllowed, allowedFromTL);
             }
           } else if (light === 'merah') {
             v._idm.trafficLight.enforced = true;
             v._idm.trafficLight.allowed = allowedFromTL;
-            v._idm.trafficLight.desiredRampSpeed = desiredRampSpeed;
-            v._idm.trafficLight.allowedByDecel = allowedByDecel;
-            v._idm.trafficLight.allowedByMove = allowedByMove;
-            v._idm.trafficLight.stoppingDist = stoppingDist;
-            v._idm.trafficLight.rampFactor = rampFactorRaw;
-
-            const currentV = (typeof v._idm.v === 'number') ? v._idm.v : (typeof v.speed === 'number' ? v.speed : 0);
-            const intended = (typeof v.speed === 'number') ? v.speed : 0;
-            const targetAfterTL = Math.min(intended, allowedFromTL);
-            const maxDecelPerFrame = safeDecel * deltaTime;
-            let newSpeed;
-            if (targetAfterTL < currentV - maxDecelPerFrame) newSpeed = Math.max(0, currentV - maxDecelPerFrame);
-            else newSpeed = Math.max(0, targetAfterTL);
-            v.speed = Math.min(v.speed || newSpeed, newSpeed);
-            if (allowedFromTL === 0) v.speed = 0;
+            v._idm.tlAllowedSpeed = allowedFromTL;
+            v._idm.tlEnforced = true;
             v._idm.trafficLight.reason = 'red_stop';
+            if (typeof v._idm._heldTlAllowed !== 'number') v._idm._heldTlAllowed = allowedFromTL;
+            else v._idm._heldTlAllowed = Math.min(v._idm._heldTlAllowed, allowedFromTL);
+            if (v._idm.trafficLight.committedOnYellow && !v._idm.trafficLight.passedEntry) {
+              v._idm.trafficLight.committedOnYellow = false;
+              v._idm.trafficLight.committedRevokedAt = now;
+            }
           } else if (light === 'hijau') {
             v._idm.trafficLight.enforced = false;
+            v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
+            v._idm.tlEnforced = false;
             v._idm.trafficLight.reason = 'green';
+            v._idm._heldTlAllowed = undefined;
           }
         } else {
           v._idm.trafficLight.enforced = false;
           v._idm.trafficLight.reason = 'out_of_lookahead';
+          v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
+          v._idm.tlEnforced = false;
         }
+        if (typeof v._idm._heldTlAllowed === 'number') {
+          if (typeof v._idm.tlAllowedSpeed !== 'number') v._idm.tlAllowedSpeed = v._idm._heldTlAllowed;
+          else v._idm.tlAllowedSpeed = Math.min(v._idm.tlAllowedSpeed, v._idm._heldTlAllowed);
+        }
+// === CEK MERGING (di bawah enforcement lampu, bukan di atas) ===
+try {
+  const arahKendaraan = v.direction;
+  const gerakan = (v.route || v.movement || 'straight').toString().toLowerCase(); // normalisasi
+  const cfg = stopLineCfg || {}; // pastikan config tersedia
+
+  // PENTING: oper lampu (object) dan cfg, bukan hanya nama arah
+  if (arahKendaraan && gerakan && hasMergingConflict(arahKendaraan, gerakan, lampu, cfg)) {
+    // 🚦 Berhenti total di belakang stop line jika merging = No dan kendaraan belum melewati entry
+    if (!v._idm.trafficLight.passedEntry) {
+      v._idm.tlAllowedSpeed = 0;
+      v._idm.tlEnforced = true;
+      v._idm.trafficLight = v._idm.trafficLight || {};
+      v._idm.trafficLight.reason = 'merge_blocked';
+      v._idm._mergeBlocked = true;
+      // pastikan kendaraan tidak maju di frame ini
+      v._idm.finalAllowedSpeed = 0;
+      continue;
+    }
+  }
+} catch (e) {
+  console.warn('Merging check error', e);
+}
       }
     }
   } catch (e) {
-    // resilient: do not break update loop
     console.error('TL enforcement error', e);
   }
 
-  // ----------------- LASER PROCESSING (unchanged) -----------------
+  // ----------------- LASER PROCESSING -----------------
   if (deltaTime > 0) {
     for (const v of vehicles) {
       if (!v) continue;
-
       v._idm = v._idm || {};
       v._idm.laser = { hit: false, hits: [] };
 
       if (v.createdAt && (now - v.createdAt) < SPAWN_GRACE_MS) {
-        if (v._laser) { v._laser.hit = false; v._laser.hitId = null; v._laser.hitPoint = null; v._laser.edgeIndex = null; }
+        v._idm.laser.hit = false;
+        v._idm.laserAllowedSpeed = v._idm.provisionalSpeed;
         continue;
       }
 
       if (!v._laser) {
-        if (v._laser) { v._laser.hit = false; v._laser.hitId = null; v._laser.hitPoint = null; }
+        v._idm.laser.hit = false;
+        v._idm.laserAllowedSpeed = v._idm.provisionalSpeed;
         continue;
       }
 
       const rays = [];
-      if (v._laser.center && v._laser.center.start && v._laser.center.end) rays.push({ name: 'center', start: v._laser.center.start, end: v._laser.center.end, meta: v._laser.center });
-      if (v._laser.left   && v._laser.left.start   && v._laser.left.end)   rays.push({ name: 'left',   start: v._laser.left.start,   end: v._laser.left.end,   meta: v._laser.left });
-      if (v._laser.right  && v._laser.right.start  && v._laser.right.end)  rays.push({ name: 'right',  start: v._laser.right.start,  end: v._laser.right.end,  meta: v._laser.right });
+      if (v._laser.center && v._laser.center.start && v._laser.center.end) rays.push({ name: 'center', start: v._laser.center.start, end: v._laser.center.end });
+      if (v._laser.left   && v._laser.left.start   && v._laser.left.end)   rays.push({ name: 'left',   start: v._laser.left.start,   end: v._laser.left.end });
+      if (v._laser.right  && v._laser.right.start  && v._laser.right.end)  rays.push({ name: 'right',  start: v._laser.right.start,  end: v._laser.right.end });
 
       if (rays.length === 0) {
-        if (v._laser) { v._laser.hit = false; v._laser.hitId = null; v._laser.hitPoint = null; }
+        v._idm.laser.hit = false;
+        v._idm.laserAllowedSpeed = v._idm.provisionalSpeed;
         continue;
       }
 
@@ -644,7 +938,6 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
             const t = inter.t;
             if (t < -1e-9 || t > 1 + 1e-9) continue;
             const dist = Math.max(0, t * rayLen);
-            if (ei === 2) continue; // ignore rear edge
             if (!bestHit || dist < bestHit.dist) {
               bestHit = { t, dist, x: inter.x, y: inter.y, edgeIndex: ei, other, rayName: ray.name };
             }
@@ -652,50 +945,45 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
         }
       }
 
-      v._laser.hit = false; v._laser.hitId = null; v._laser.hitPoint = null;
-      if (v._laser.center) { v._laser.center.hit = false; v._laser.center.hitPoint = null; }
-      if (v._laser.left)   { v._laser.left.hit = false; v._laser.left.hitPoint = null; }
-      if (v._laser.right)  { v._laser.right.hit = false; v._laser.right.hitPoint = null; }
-
-      if (bestHit) {
-        const distToHit = bestHit.dist;
-        const stoppingDist = Math.max(0, distToHit - LASER_SAFE_STOP_PX);
-        const allowedFromLaser = Math.max(0, stoppingDist / deltaTime);
-
-        v._idm.laser.hit = true;
-        v._idm.laser.hits.push({
-          ray: bestHit.rayName, otherId: bestHit.other.id, edgeIndex: bestHit.edgeIndex,
-          point: { x: bestHit.x, y: bestHit.y }, dist: bestHit.dist, allowedSpeed: allowedFromLaser
-        });
-
-        v._laser.hit = true;
-        v._laser.hitId = bestHit.other.id;
-        v._laser.hitPoint = { x: bestHit.x, y: bestHit.y };
-        v._laser.edgeIndex = bestHit.edgeIndex;
-
-        if (bestHit.rayName === 'center' && v._laser.center) {
-          v._laser.center.hit = true; v._laser.center.hitPoint = { x: bestHit.x, y: bestHit.y };
-        } else if (bestHit.rayName === 'left' && v._laser.left) {
-          v._laser.left.hit = true; v._laser.left.hitPoint = { x: bestHit.x, y: bestHit.y };
-        } else if (bestHit.rayName === 'right' && v._laser.right) {
-          v._laser.right.hit = true; v._laser.right.hitPoint = { x: bestHit.x, y: bestHit.y };
-        }
-
-        if (typeof v.speed === 'number') {
-          v.speed = Math.max(0, Math.min(v.speed, allowedFromLaser));
-        } else {
-          v.speed = allowedFromLaser;
-        }
-
-        continue;
-      } else {
+      if (!bestHit) {
         v._idm.laser.hit = false;
-        v._laser.hit = false; v._laser.hitId = null; v._laser.hitPoint = null; v._laser.edgeIndex = null;
+        v._idm.laserAllowedSpeed = v._idm.provisionalSpeed;
+        if (v._laser) { v._laser.hit = false; v._laser.hitId = null; v._laser.hitPoint = null; v._laser.edgeIndex = null; }
+        v._idm._lastLaserCap = undefined;
+        continue;
       }
+
+      const distToHit = bestHit.dist;
+      const stoppingDist = Math.max(0, distToHit - LASER_SAFE_STOP_PX);
+      const safeDecel = Math.max(1e-9, TL_COMFORT_DECEL);
+      const allowedByDecel = Math.sqrt(2 * safeDecel * Math.max(0, stoppingDist));
+      const allowedByTTC = (deltaTime > 0) ? (stoppingDist / deltaTime) : allowedByDecel;
+      let allowedFromLaser = Math.max(0, Math.min(allowedByDecel, allowedByTTC));
+
+      const SMOOTH_ALPHA = 0.45;
+      v._idm._lastLaserCap = (typeof v._idm._lastLaserCap === 'number') ? (SMOOTH_ALPHA * allowedFromLaser + (1 - SMOOTH_ALPHA) * v._idm._lastLaserCap) : allowedFromLaser;
+      const appliedCap = Math.max(0, v._idm._lastLaserCap);
+
+      v._idm.laser.hit = true;
+      v._idm.laser.hits.push({
+        ray: bestHit.rayName, otherId: bestHit.other.id, edgeIndex: bestHit.edgeIndex,
+        point: { x: bestHit.x, y: bestHit.y }, dist: bestHit.dist, allowedSpeed: appliedCap
+      });
+
+      v._idm.laserAllowedSpeed = appliedCap;
+
+      v._laser = v._laser || {};
+      v._laser.hit = true;
+      v._laser.hitId = bestHit.other.id;
+      v._laser.hitPoint = { x: bestHit.x, y: bestHit.y };
+      v._laser.edgeIndex = bestHit.edgeIndex;
+      if (bestHit.rayName === 'center' && v._laser.center) { v._laser.center.hit = true; v._laser.center.hitPoint = { x: bestHit.x, y: bestHit.y }; }
+      if (bestHit.rayName === 'left' && v._laser.left) { v._laser.left.hit = true; v._laser.left.hitPoint = { x: bestHit.x, y: bestHit.y }; }
+      if (bestHit.rayName === 'right' && v._laser.right) { v._laser.right.hit = true; v._laser.right.hitPoint = { x: bestHit.x, y: bestHit.y }; }
     }
   }
 
-  // 2) overlap prevention (unchanged)
+  // 2) overlap prevention
   const all = vehicles.slice();
   for (let i = 0; i < all.length; i++) {
     const v = all[i];
@@ -705,13 +993,15 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
     if (v.createdAt && (now - v.createdAt) < SPAWN_GRACE_MS) {
       v._idm.overlapScale = 1.0;
       v._idm.overlapCandidateId = null;
-      v._idm.overlapAllowedSpeed = v.speed;
+      v._idm.overlapAllowedSpeed = v._idm.provisionalSpeed;
+      v._idm.overlapAllowedSpeedApplied = v._idm.provisionalSpeed;
       continue;
     }
 
     if (!v.debugBox) {
       v._idm.overlapScale = 1.0;
       v._idm.overlapCandidateId = null;
+      v._idm.overlapAllowedSpeed = v._idm.provisionalSpeed;
       continue;
     }
     let bestScale = 1.0;
@@ -743,20 +1033,44 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
       }
     }
 
+    v._idm.overlapScale = bestScale;
+    v._idm.overlapCandidateId = candidate;
     if (bestScale < 1.0) {
-      const intended = (typeof v._idm.cappedSpeed === 'number') ? v._idm.cappedSpeed : ((typeof v.maxSpeed === 'number') ? v.maxSpeed : v.speed);
+      const intended = (typeof v._idm.cappedSpeed === 'number') ? v._idm.cappedSpeed : ((typeof v.maxSpeed === 'number') ? v.maxSpeed : (v._idm.provisionalSpeed || 0));
       const allowedFromIntended = Math.max(0, intended * bestScale);
-      const allowedFromProvisional = Math.max(0, (v.speed || 0) * bestScale);
+      const allowedFromProvisional = Math.max(0, (v._idm.provisionalSpeed || 0) * bestScale);
       const newSpeed = Math.min(allowedFromIntended, allowedFromProvisional);
-      v._idm.overlapCandidateId = candidate;
-      v._idm.overlapScale = bestScale;
       v._idm.overlapAllowedSpeed = newSpeed;
-      v.speed = Math.max(0, newSpeed);
     } else {
-      v._idm.overlapCandidateId = null;
-      v._idm.overlapScale = 1.0;
-      v._idm.overlapAllowedSpeed = v.speed;
+      v._idm.overlapAllowedSpeed = v._idm.provisionalSpeed;
     }
+  }
+
+  // ----------------- FINAL SPEED APPLY (single place) -----------------
+  for (const v of vehicles) {
+    if (!v) continue;
+    v._idm = v._idm || {};
+
+    const provisional = (typeof v._idm.provisionalSpeed === 'number') ? v._idm.provisionalSpeed : ((typeof v.speed === 'number') ? v.speed : 0);
+    const tlAllowed = (typeof v._idm.tlAllowedSpeed === 'number') ? v._idm.tlAllowedSpeed : provisional;
+    const laserAllowed = (typeof v._idm.laserAllowedSpeed === 'number') ? v._idm.laserAllowedSpeed : provisional;
+    const overlapAllowed = (typeof v._idm.overlapAllowedSpeed === 'number') ? v._idm.overlapAllowedSpeed : provisional;
+
+    let final = provisional;
+    final = Math.min(final, tlAllowed, laserAllowed, overlapAllowed);
+
+    final = Math.max(0, final);
+
+    if (typeof v._idm._heldTlAllowed === 'number') {
+      final = Math.min(final, v._idm._heldTlAllowed);
+    }
+
+    const MAX_FRAME_ACCEL = (IDM_PARAMS.a * 4.0) * (deltaTime);
+    const currentSpeed = (typeof v.speed === 'number') ? v.speed : 0;
+    final = Math.min(final, currentSpeed + Math.max(0, MAX_FRAME_ACCEL));
+
+    v.speed = final;
+    v._idm.finalAppliedSpeed = final;
   }
 }
 
