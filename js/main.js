@@ -4,6 +4,7 @@
  * - Mengubah drawEntryLaneNumbers dan drawExitLaneNumbers agar menyimpan koordinat selain menggambarnya.
  * - Spawn & movement kendaraan didelegasikan ke vehmov.js (createVehMovController).
  * - MEMPERBAIKI URUTAN PENAMAAN LAJUR KELUAR UTARA DAN TIMUR
+ * - Modifikasi: Menambahkan 'Belok Kiri Jalan Terus' (Global Switch)
  */
 
 import { drawUtara } from './InfrastrukturJalan/utara.js';
@@ -17,14 +18,34 @@ import { getLaneButtonPositions } from './InfrastrukturJalan/drawArrow.js';
 import { drawLaneCenters, drawVehicle } from "./vehicle.js";
 import { createVehMovController } from './vehmov.js'; // <-- controller baru
 import { updateAntrian } from './antrian.js';
+import createSiklusLampu from './SiklusLampu.js';
 
 document.addEventListener('DOMContentLoaded', init);
+
+// Global references agar bisa diakses fungsi resetSimulation
+let lampu = null;
+let vehController = null;
+let siklus = null;
+let lastTimestamp = 0;
+let running = false;
+let simSpeed = 1;
+let phaseMode = "searah"; // default
 
 // Objek untuk menyimpan koordinat lajur masuk dan keluar
 const laneCoordinates = {
     entry: {},
     exit: {}
 };
+
+// ------------------- Struktur data per-lajur -------------------
+// laneTrafficConfig[arah] = array of lanes [{ flow, motorPct, mobilPct, trukPct, carPct, truckPct }, ...]
+let laneTrafficConfig = {
+    utara: [],
+    timur: [],
+    selatan: [],
+    barat: []
+};
+// ---------------------------------------------------------------------
 
 function init() {
     const canvas = document.getElementById('simCanvas');
@@ -33,6 +54,45 @@ function init() {
         console.error("main.js: simCanvas atau vehicleCanvas tidak ditemukan di DOM.");
         return;
     }
+
+// Sinkronisasi: saat lampu direset → reset juga diagram siklus
+window.addEventListener("resetCycleCanvas", (e) => {
+  console.log("🔁 Reset cycleCanvas triggered:", e.detail);
+  if (typeof resetCycleDiagram === "function") {
+    resetCycleDiagram(); // fungsi ini ada di modul siklus animasi (cycleCanvas)
+  }
+});
+
+    const cycleCanvas = document.getElementById('cycleCanvas');
+    let siklusLocal = null;
+
+ if (cycleCanvas) {
+      const durAllRedEl = document.getElementById('durAllRed');
+      const durYellowEl = document.getElementById('durYellow');
+      const durCycleTotalEl = document.getElementById('durCycleTotal');
+      const durAllRed = durAllRedEl ? parseFloat(durAllRedEl.value) || 0 : 0;
+      const durYellow = durYellowEl ? parseFloat(durYellowEl.value) || 0 : 0;
+      const durCycleTotal = durCycleTotalEl ? parseFloat(durCycleTotalEl.value) || 60 : 60;
+
+      siklusLocal = createSiklusLampu({
+        canvas: cycleCanvas,
+        cycleTotalSec: durCycleTotal,
+        allRedSec: durAllRed,
+        yellowSec: durYellow
+      });
+
+['durAllRed', 'durYellow', 'durCycleTotal'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', () => {
+          const red = document.getElementById('durAllRed') ? parseFloat(document.getElementById('durAllRed').value) || 0 : 0;
+          const yellow = document.getElementById('durYellow') ? parseFloat(document.getElementById('durYellow').value) || 0 : 0;
+          const total = document.getElementById('durCycleTotal') ? parseFloat(document.getElementById('durCycleTotal').value) || 60 : 60;
+          if (siklusLocal && typeof siklusLocal.setParams === 'function') siklusLocal.setParams(total, red, yellow);
+        });
+      });
+    }
+    siklus = siklusLocal;
+
     const ctx = canvas.getContext('2d');
     const vctx = vehicleCanvas.getContext('2d');
 
@@ -60,7 +120,13 @@ function init() {
     config.cx = canvas.width / 2;
     config.cy = canvas.height / 2;
 
-    const lampu = new LampuLaluLintas("simCanvas");
+    lampu = new LampuLaluLintas("simCanvas");
+    // pastikan siklus diagram menggunakan lampu utama sebagai sumber kebenaran
+    try {
+      if (typeof siklusLocal !== 'undefined' && siklusLocal && typeof siklusLocal.syncWithLampu === 'function') {
+        siklusLocal.syncWithLampu(lampu);
+      }
+    } catch(e) { console.warn('syncWithLampu failed', e); }
 
     const configTraffic = {
         utara: { flow: 500, truckPct: 20 },
@@ -68,6 +134,62 @@ function init() {
         selatan: { flow: 500, truckPct: 20 },
         barat: { flow: 500, truckPct: 20 },
     };
+// === TAMBAHAN MODEL 3 FASE ===
+// Inisialisasi default mode fase searah
+try {
+  siklus.setPhaseMode("searah");
+  lampu.setPhaseMode("searah", false);
+  setActivePhaseButton("searah");
+} catch (e) { console.warn("Init phaseMode gagal:", e); }
+
+// Fungsi bantu: menandai tombol aktif di UI
+function setActivePhaseButton(mode) {
+  const map = {
+    searah: document.getElementById("fase-searah"),
+    berhadapan: document.getElementById("fase-berhadapan"),
+    berseberangan: document.getElementById("fase-berseberangan"),
+  };
+  Object.values(map).forEach(el => { if (el) el.classList.remove("active"); });
+  const activeEl = map[mode];
+  if (activeEl) activeEl.classList.add("active");
+}
+
+// Event listener untuk tombol 3 model fase
+[
+  ["fase-searah", "searah"],
+  ["fase-berhadapan", "berhadapan"],
+  ["fase-berseberangan", "berseberangan"],
+].forEach(([id, mode]) => {
+  const btn = document.getElementById(id);
+  if (btn) {
+    btn.addEventListener("click", () => {
+      console.log(`[UI] Ganti mode fase -> ${mode}`);
+      try {
+        phaseMode = mode;
+        lampu.setPhaseMode(mode, true); // langsung potong fase aktif
+        siklus.setPhaseMode(mode);
+        setActivePhaseButton(mode);
+
+        // Hitung durasi hijau otomatis
+        const allRed = Number(document.getElementById("durAllRed").value);
+        const yellow = Number(document.getElementById("durYellow").value);
+        const total = Number(document.getElementById("durCycleTotal").value);
+        let green;
+        if (mode === "searah") green = (total / 4) - allRed - yellow;
+        else green = (total / 2) - allRed - yellow;
+        if (green <= 0) {
+          alert("Durasi fase terlalu singkat — nilai hijau diatur minimum 1 detik.");
+          green = 1;
+        }
+        document.getElementById("displayGreenCalc").textContent =
+          `Hijau (${mode}): ${green.toFixed(1)} detik`;
+      } catch (e) {
+        console.warn("Gagal mengubah mode fase:", e);
+      }
+    });
+  }
+});
+// === TAMBAHAN MODEL 3 FASE SELESAI ===
 
     const MAX_FLOW_PER_LANE = 600;
     function getMaxFlow(arah) { return (config[arah] && config[arah].in) * MAX_FLOW_PER_LANE; }
@@ -103,7 +225,12 @@ function init() {
         select.value = 2;
     }
     ['inNorth', 'outNorth', 'inEast', 'outEast', 'inSouth', 'outSouth', 'inWest', 'outWest'].forEach(populateDropdown);
-    ['inNorth', 'outNorth', 'inEast', 'outEast', 'inSouth', 'outSouth', 'inWest', 'outWest'].forEach(id => {
+    
+    // event listener untuk switch & dropdown
+    [
+      'inNorth', 'outNorth', 'inEast', 'outEast', 'inSouth', 'outSouth', 'inWest', 'outWest',
+      'ltsorGlobalSwitch'
+    ].forEach(id => {
         const el = $(id);
         if (el) el.addEventListener('change', updateConfig);
     });
@@ -111,17 +238,12 @@ function init() {
     const radiusSlider = $('customRange');
     const radiusValueDisplay = $('rangeVal');
 
-    // ---------- CACHE / LOCKING MECHANISM ----------
-    // Menyimpan snapshot koordinat awal (entry/exit) dan konfigurasi lajur saat itu
+   // ---------- CACHE / LOCKING MECHANISM ----------
     let initialCaptured = false;
     let initialLaneCoordinates = null;
     let initialConfigSnapshot = null;
-    // ketika true -> gunakan cached coordinates (jangan hitung ulang)
     let laneCoordinatesLocked = false;
-    // nilai default (persis) untuk mengembalikan cache
     const defaultRadius = sliderInitial;
-
-    // helper
     function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
     function configsEqual(a, b) {
         if (!a || !b) return false;
@@ -132,24 +254,17 @@ function init() {
         }
         return true;
     }
-
     if (radiusSlider) {
-        // pastikan config radius mengikuti slider awal
         config.radiusValue = parseFloat(radiusSlider.value);
         if (radiusValueDisplay) radiusValueDisplay.textContent = radiusSlider.value;
-
         radiusSlider.addEventListener("input", function() {
             const newVal = parseFloat(this.value);
             config.radiusValue = newVal;
             if (radiusValueDisplay) radiusValueDisplay.textContent = this.value;
-
-            // jika user kembali ke nilai default (dengan toleransi), dan konfigurasi lajur sama seperti awal -> kunci
             const epsilon = 0.0001;
             const isAtDefault = Math.abs(newVal - defaultRadius) < epsilon;
-
             if (isAtDefault && initialCaptured && configsEqual(config, initialConfigSnapshot)) {
                 laneCoordinatesLocked = true;
-                // restore exact cached coords
                 if (initialLaneCoordinates) {
                     laneCoordinates.entry = deepClone(initialLaneCoordinates.entry || {});
                     laneCoordinates.exit = deepClone(initialLaneCoordinates.exit || {});
@@ -157,19 +272,16 @@ function init() {
             } else {
                 laneCoordinatesLocked = false;
             }
-
             try { lampu.updatePosition(config); } catch (e) { }
-            // menggambar layout — fungsi drawEntry/drawExit memperhatikan `laneCoordinatesLocked`
             drawLayout();
-
-            // inform controller (jika sudah ada)
             if (typeof vehController?.setLaneCoordinates === 'function') {
                 vehController.setLaneCoordinates(laneCoordinates);
             }
         });
     }
+    // (Akhir kode cache)
 
-    const directionSelect = $('directionSelect');
+      const directionSelect = $('directionSelect');
     const flowSlider = $('trafficFlowSlider');
     const flowValue = $('flowValue');
     const truckSlider = $('truckPercentageSlider');
@@ -196,12 +308,341 @@ function init() {
         const arah = directionSelect ? directionSelect.value : 'utara';
         configTraffic[arah].flow = parseInt(flowSlider.value);
         if (flowValue) flowValue.textContent = `${flowSlider.value} smp/jam (maks: ${flowSlider.max})`;
+        distributeDirectionFlowToLanes(arah);
     });
     if (truckSlider) truckSlider.addEventListener("input", () => {
         const arah = directionSelect ? directionSelect.value : 'utara';
         configTraffic[arah].truckPct = parseInt(truckSlider.value);
-        if (truckValue) truckValue.textContent = `${truckSlider.value}%`;
+        if (truckValue) flowValue.textContent = `${truckSlider.value}%`;
+        distributeDirectionTruckPctToLanes(arah);
     });
+
+     // ------------------- FUNGSI BARU: manage laneTrafficConfig -------------------
+
+    function buildDefaultLaneTrafficConfig() {
+        ["utara","timur","selatan","barat"].forEach(arah => {
+            const lanes = config[arah]?.in || 0;
+            const totalFlow = configTraffic[arah]?.flow ?? 500;
+            const truckPct = configTraffic[arah]?.truckPct ?? 20;
+            laneTrafficConfig[arah] = [];
+            const base = Math.floor(totalFlow / Math.max(1, lanes));
+            for (let i = 0; i < lanes; i++) {
+                const mobilVal = Math.round((100 - truckPct) / 2);
+                const laneObj = {
+                    flow: base,
+                    motorPct: Math.round(mobilVal),
+                    mobilPct: Math.round(mobilVal),
+                    trukPct: truckPct
+                };
+                // aliases for compatibility with different naming in vehmov
+                laneObj.carPct = laneObj.mobilPct;
+                laneObj.truckPct = laneObj.trukPct;
+                laneTrafficConfig[arah].push(laneObj);
+            }
+            let remainder = totalFlow - base * lanes;
+            let idx = 0;
+            while (remainder > 0 && lanes > 0) {
+                laneTrafficConfig[arah][idx % lanes].flow += 1;
+                remainder--; idx++;
+            }
+        });
+    }
+
+    function rebuildLaneTrafficConfig() {
+        ["utara","timur","selatan","barat"].forEach(arah => {
+            const lanes = Math.max(0, (config[arah] && config[arah].in) ? config[arah].in : 0);
+            if (!Array.isArray(laneTrafficConfig[arah])) laneTrafficConfig[arah] = [];
+            while (laneTrafficConfig[arah].length < lanes) {
+                const obj = { flow: 0, motorPct: 40, mobilPct: 40, trukPct: 20 };
+                obj.carPct = obj.mobilPct; obj.truckPct = obj.trukPct;
+                laneTrafficConfig[arah].push(obj);
+            }
+            while (laneTrafficConfig[arah].length > lanes) laneTrafficConfig[arah].pop();
+        });
+    }
+
+    function distributeDirectionFlowToLanes(arah) {
+        const lanes = config[arah]?.in || 0;
+        if (lanes <= 0) return;
+        const total = configTraffic[arah]?.flow ?? 0;
+        const base = Math.floor(total / lanes);
+        for (let i = 0; i < lanes; i++) {
+            if (!laneTrafficConfig[arah][i]) laneTrafficConfig[arah][i] = { flow: 0, motorPct: 40, mobilPct: 40, trukPct: 20 };
+            laneTrafficConfig[arah][i].flow = base;
+        }
+        let rem = total - base * lanes;
+        let j = 0;
+        while (rem > 0) { laneTrafficConfig[arah][j % lanes].flow += 1; rem--; j++; }
+        const truck = configTraffic[arah]?.truckPct ?? 20;
+        for (let i = 0; i < lanes; i++) {
+            const tr = laneTrafficConfig[arah][i].trukPct ?? truck;
+            laneTrafficConfig[arah][i].trukPct = tr;
+            const remainPct = Math.max(0, 100 - tr);
+            laneTrafficConfig[arah][i].motorPct = Math.round(remainPct/2);
+            laneTrafficConfig[arah][i].mobilPct = remainPct - laneTrafficConfig[arah][i].motorPct;
+            // aliases:
+            laneTrafficConfig[arah][i].carPct = laneTrafficConfig[arah][i].mobilPct;
+            laneTrafficConfig[arah][i].truckPct = laneTrafficConfig[arah][i].trukPct;
+        }
+        if (typeof vehController?.setLaneTrafficConfig === 'function') {
+            try { vehController.setLaneTrafficConfig(laneTrafficConfig); } catch (e) { console.warn("setLaneTrafficConfig failed:", e); }
+        }
+    }
+
+    function distributeDirectionTruckPctToLanes(arah) {
+        const lanes = config[arah]?.in || 0;
+        const truck = configTraffic[arah]?.truckPct ?? 20;
+        for (let i = 0; i < lanes; i++) {
+            if (!laneTrafficConfig[arah][i]) laneTrafficConfig[arah][i] = { flow: 0, motorPct: 40, mobilPct: 40, trukPct: truck };
+            laneTrafficConfig[arah][i].trukPct = truck;
+            const remainPct = Math.max(0, 100 - truck);
+            laneTrafficConfig[arah][i].motorPct = Math.round(remainPct/2);
+            laneTrafficConfig[arah][i].mobilPct = remainPct - laneTrafficConfig[arah][i].motorPct;
+            // aliases
+            laneTrafficConfig[arah][i].carPct = laneTrafficConfig[arah][i].mobilPct;
+            laneTrafficConfig[arah][i].truckPct = laneTrafficConfig[arah][i].trukPct;
+        }
+        if (typeof vehController?.setLaneTrafficConfig === 'function') {
+            try { vehController.setLaneTrafficConfig(laneTrafficConfig); } catch (e) { console.warn("setLaneTrafficConfig failed:", e); }
+        }
+    }
+
+    // ------------------- Normalisasi pembantu -------------------
+    // Mengembalikan 3 integer yang jumlahnya 100 (jika semua 0 -> default [33,33,34])
+    function normalizeThree(a,b,c){
+        const raw = [Number(a)||0, Number(b)||0, Number(c)||0];
+        const sum = raw[0]+raw[1]+raw[2];
+        if(sum === 0) return [33,33,34];
+        const floats = raw.map(v => (v / sum) * 100);
+        const floors = floats.map(f => Math.floor(f));
+        let rem = 100 - (floors[0] + floors[1] + floors[2]);
+        const fracs = floats.map((f,i)=>({i, frac: f - floors[i]}));
+        fracs.sort((x,y)=> y.frac - x.frac);
+        const result = floors.slice();
+        for(let k=0;k<rem;k++){
+          result[fracs[k].i] += 1;
+        }
+        return result;
+    }
+
+    // ------------------- BACA PER-LAJUR DARI DOM (ROBUST) -------------------
+    // - Mencari pola id (backwards compatibility)
+    // - Jika tidak ada id, fallback ke DOM dinamis '#laneInputsContainer' dengan .lane-row
+    function readLaneTrafficInputs() {
+        console.debug('[main] readLaneTrafficInputs called');
+        rebuildLaneTrafficConfig();
+
+        // helper untuk mencari elemen id pola (kembali kompatibel)
+        const findElByPatterns = (patterns) => {
+            for (const id of patterns) {
+                const el = document.getElementById(id);
+                if (el) return el;
+            }
+            return null;
+        };
+
+        const directions = ['utara','timur','selatan','barat'];
+        const directionSelectEl = document.getElementById('directionSelect');
+        const currentDirShown = directionSelectEl ? directionSelectEl.value : null;
+        const laneInputsContainer = document.getElementById('laneInputsContainer');
+
+        directions.forEach(arah => {
+            const lanes = config[arah]?.in || 0;
+            // ensure array exists
+            if (!Array.isArray(laneTrafficConfig[arah])) laneTrafficConfig[arah] = [];
+            for (let idx = 0; idx < lanes; idx++) {
+                const laneIndex1 = idx + 1;
+                // default fallback values
+                let flow = laneTrafficConfig[arah][idx]?.flow || 0;
+                let motor = laneTrafficConfig[arah][idx]?.motorPct ?? 50;
+                let mobil = laneTrafficConfig[arah][idx]?.mobilPct ?? 30;
+                let truk = laneTrafficConfig[arah][idx]?.trukPct ?? 20;
+
+                try {
+                    // 1) Coba pola ID umum (backwards compatible)
+                    const synonyms = { utara:['utara','north'], timur:['timur','east'], selatan:['selatan','south'], barat:['barat','west'] }[arah];
+                    const possibleFlowIds = [
+                        `${arah}_lane${laneIndex1}_flow`, `${arah}_lane_${laneIndex1}_flow`, `${synonyms[0]}_lane${laneIndex1}_flow`,
+                        `${synonyms[1]}_lane${laneIndex1}_flow`, `${arah}_lane${laneIndex1}Flow`, `${synonyms[0]}_lane${laneIndex1}_flow`
+                    ];
+                    const possibleMotorIds = [
+                        `${arah}_lane${laneIndex1}_motor`, `${arah}_lane${laneIndex1}_motorPct`, `${arah}_lane${laneIndex1}_motor_pct`,
+                        `${synonyms[0]}_lane${laneIndex1}_motor`
+                    ];
+                    const possibleMobilIds = [
+                        `${arah}_lane${laneIndex1}_mobil`, `${arah}_lane${laneIndex1}_carPct`, `${arah}_lane${laneIndex1}_mobilPct`,
+                        `${synonyms[0]}_lane${laneIndex1}_mobil`
+                    ];
+                    const possibleTrukIds = [
+                        `${arah}_lane${laneIndex1}_truk`, `${arah}_lane${laneIndex1}_truckPct`, `${arah}_lane${laneIndex1}_trukPct`,
+                        `${synonyms[0]}_lane${laneIndex1}_truk`
+                    ];
+
+                    const elFlow = findElByPatterns(possibleFlowIds);
+                    const elMotor = findElByPatterns(possibleMotorIds);
+                    const elMobil = findElByPatterns(possibleMobilIds);
+                    const elTruk = findElByPatterns(possibleTrukIds);
+
+                    if (elFlow) {
+                        const v = parseFloat(elFlow.value);
+                        if (!Number.isNaN(v)) flow = Math.max(0, Math.round(v));
+                    }
+                    if (elMotor) {
+                        const v = parseFloat(elMotor.value);
+                        if (!Number.isNaN(v)) motor = v;
+                    }
+                    if (elMobil) {
+                        const v = parseFloat(elMobil.value);
+                        if (!Number.isNaN(v)) mobil = v;
+                    }
+                    if (elTruk) {
+                        const v = parseFloat(elTruk.value);
+                        if (!Number.isNaN(v)) truk = v;
+                    }
+
+                    // 2) Jika elemen-per-lajur tidak ada sebagai id, coba baca dari laneInputsContainer
+                    //    BUT: laneInputsContainer umumnya hanya berisi lajur untuk arah yang dipilih (currentDirShown)
+                    if ((!elFlow && !elMotor && !elMobil && !elTruk) && laneInputsContainer && currentDirShown === arah) {
+                        // ambil semua .lane-row di container — urutannya sesuai lajur 1..N
+                        const rows = Array.from(laneInputsContainer.querySelectorAll('.lane-row'));
+                        if (rows[idx]) {
+                            const row = rows[idx];
+                            // flow: number input yang bukan .ratio-input (prioritas dataset.field==='flow' kalau ada)
+                            const flowByDataset = row.querySelector('input[data-field="flow"]');
+                            const flowCandidate = flowByDataset || row.querySelector('input[type="number"]:not(.ratio-input)');
+                            if (flowCandidate) {
+                                const v = parseFloat(flowCandidate.value);
+                                if (!Number.isNaN(v)) flow = Math.max(0, Math.round(v));
+                            }
+                            // ratio inputs: class .ratio-input OR inputs with dataset fields motorPct/carPct/truckPct
+                            let motorByDataset = row.querySelector('input[data-field="motorPct"].ratio-input') || row.querySelector('input[data-field="motorPct"]');
+                            let mobilByDataset = row.querySelector('input[data-field="carPct"].ratio-input') || row.querySelector('input[data-field="carPct"]');
+                            let trukByDataset  = row.querySelector('input[data-field="truckPct"].ratio-input') || row.querySelector('input[data-field="truckPct"]');
+
+                            // fallback: find first three .ratio-input in row
+                            const ratioInputs = row.querySelectorAll('input.ratio-input');
+                            if (!motorByDataset && ratioInputs.length >= 1) motorByDataset = ratioInputs[0];
+                            if (!mobilByDataset && ratioInputs.length >= 2) mobilByDataset = ratioInputs[1];
+                            if (!trukByDataset && ratioInputs.length >= 3) trukByDataset = ratioInputs[2];
+
+                            if (motorByDataset) {
+                                const v = parseFloat(motorByDataset.value);
+                                if (!Number.isNaN(v)) motor = v;
+                            }
+                            if (mobilByDataset) {
+                                const v = parseFloat(mobilByDataset.value);
+                                if (!Number.isNaN(v)) mobil = v;
+                            }
+                            if (trukByDataset) {
+                                const v = parseFloat(trukByDataset.value);
+                                if (!Number.isNaN(v)) truk = v;
+                            }
+                        }
+                    }
+
+                    // 3) Jika tidak ada input sama sekali untuk rasio: gunakan fallback global truck slider atau configTraffic
+                    if (!elMotor && !elMobil && !elTruk) {
+                        const globalTruckSlider = document.getElementById('truckPercentageSlider') || document.getElementById('truckSlider') || null;
+                        if (globalTruckSlider) {
+                            const tp = parseFloat(globalTruckSlider.value) || configTraffic[arah]?.truckPct || 20;
+                            truk = tp;
+                            const remain = Math.max(0, 100 - truk);
+                            motor = Math.round(remain / 2);
+                            mobil = remain - motor;
+                        } else {
+                            const tp = configTraffic[arah]?.truckPct ?? 20;
+                            truk = tp;
+                            const remain = Math.max(0, 100 - tp);
+                            motor = Math.round(remain / 2);
+                            mobil = remain - motor;
+                        }
+                    }
+
+                    // 4) Normalisasi bobot agar total = 100 (menggunakan normalizeThree)
+                    const [nm, nc, nt] = normalizeThree(motor, mobil, truk);
+                    // Set kembali ke laneTrafficConfig dengan pembulatan & safety clamp
+                    const laneObj = {
+                        flow: Math.max(0, Math.round(Number(flow || 0))),
+                        motorPct: Math.max(0, Math.round(Number(nm || 0))),
+                        mobilPct: Math.max(0, Math.round(Number(nc || 0))),
+                        trukPct: Math.max(0, Math.round(Number(nt || 0)))
+                    };
+                    // compatibility aliases:
+                    laneObj.carPct = laneObj.mobilPct;
+                    laneObj.truckPct = laneObj.trukPct;
+
+                    laneTrafficConfig[arah][idx] = laneObj;
+
+                    console.debug(`[main] lane ${arah} #${idx+1} => flow=${laneObj.flow}, motor=${laneObj.motorPct}, mobil=${laneObj.mobilPct}, truk=${laneObj.trukPct}`);
+                } catch (err) {
+                    console.warn(`[main] readLaneTrafficInputs: failed to parse lane ${arah} #${idx+1}`, err);
+                }
+            }
+        });
+
+        // Notify vehController (kirim salinan yang berisi alias agar vehmov tak tergantung satu nama properti)
+        try {
+            // deep clone to avoid accidental mutation by vehController
+            const payload = JSON.parse(JSON.stringify(laneTrafficConfig));
+            // ensure aliases on payload as well
+            Object.keys(payload).forEach(arah => {
+                (payload[arah] || []).forEach(lane => {
+                    if (lane.mobilPct !== undefined && lane.carPct === undefined) lane.carPct = lane.mobilPct;
+                    if (lane.trukPct !== undefined && lane.truckPct === undefined) lane.truckPct = lane.trukPct;
+                });
+            });
+            if (typeof vehController?.setLaneTrafficConfig === 'function') {
+                vehController.setLaneTrafficConfig(payload);
+                console.log('[main] sent laneTrafficConfig -> vehController', payload);
+            } else {
+                // still store locally (already done above)
+                console.debug('[main] vehController.setLaneTrafficConfig not available yet; laneTrafficConfig updated locally.');
+            }
+        } catch (e) {
+            console.warn("vehController.setLaneTrafficConfig failed:", e);
+        }
+    }
+
+    // Attach listeners: memonitor input yang relevan (baik id lama maupun input dinamis)
+    function attachPerLaneInputListeners() {
+        // 1) Add generic change listeners to all inputs/selects that likely affect traffic config
+        const all = Array.from(document.querySelectorAll('input, select'));
+        all.forEach(el => {
+            const id = el.id || '';
+            if (/(utara|timur|selatan|barat|north|east|south|west|lane|flow|motor|mobil|truk|truck|Pct|pct|percentage|ratio|bobot)/i.test(id) || el.classList.contains('ratio-input') || (el.closest && el.closest('.lane-row'))) {
+                el.addEventListener('change', () => {
+                    // read only the currently visible direction rows (and update laneTrafficConfig)
+                    readLaneTrafficInputs();
+                });
+                // also on input for immediate feedback
+                el.addEventListener('input', () => readLaneTrafficInputs());
+            }
+        });
+
+        // 2) Observe dynamic insertion/removal inside #laneInputsContainer (rendered by index.html)
+        const container = document.getElementById('laneInputsContainer');
+        if (container && typeof MutationObserver !== 'undefined') {
+            const mo = new MutationObserver((mutations) => {
+                // attach listeners to newly added inputs inside rows
+                mutations.forEach(m => {
+                    m.addedNodes.forEach(node => {
+                        if (!(node instanceof HTMLElement)) return;
+                        const inputs = Array.from(node.querySelectorAll ? node.querySelectorAll('input, select') : []);
+                        inputs.forEach(inp => {
+                            if (!inp._laneListenerAttached) {
+                                inp.addEventListener('change', readLaneTrafficInputs);
+                                inp.addEventListener('input', readLaneTrafficInputs);
+                                inp._laneListenerAttached = true;
+                            }
+                        });
+                    });
+                });
+            });
+            mo.observe(container, { childList: true, subtree: true });
+        }
+    }
+
+    // ------------------- END FUNGSI BARU -------------------
 
     function updateConfig() {
         const inNorth = $('inNorth'), outNorth = $('outNorth'),
@@ -218,6 +659,10 @@ function init() {
         if (inWest) config.barat.in = parseInt(inWest.value);
         if (outWest) config.barat.out = parseInt(outWest.value);
 
+       // --- Membaca status switch ---
+        config.ltsorGlobal = $('ltsorGlobalSwitch')?.checked ?? false;
+        config.merging = $('mergingSwitch')?.checked ?? true;
+
         laneArrows.utara = Array((config.utara.in || 0)).fill("straight");
         laneArrows.timur = Array((config.timur.in || 0)).fill("straight");
         laneArrows.selatan = Array((config.selatan.in || 0)).fill("straight");
@@ -227,7 +672,7 @@ function init() {
         try { lampu.updatePosition(config); } catch (e) { }
         updateTrafficUI();
 
-        // Jika user mengganti konfigurasi lajur, buang cache awal — agar tidak restore koordinat usang
+        // Jika user mengganti konfigurasi lajur, buang cache awal
         if (initialCaptured && !configsEqual(config, initialConfigSnapshot)) {
             initialCaptured = false;
             initialLaneCoordinates = null;
@@ -235,46 +680,54 @@ function init() {
             laneCoordinatesLocked = false;
         }
 
+        // (BARU) rekonstruksi laneTrafficConfig & baca ulang per-lajur
+        rebuildLaneTrafficConfig();
+        readLaneTrafficInputs();
+
         drawLayout();
 
-        // inform vehController about updated lane coordinates (if controller supports it)
+        // inform vehController about updated lane coordinates & traffic
         if (typeof vehController?.setLaneCoordinates === 'function') {
             vehController.setLaneCoordinates(laneCoordinates);
+        }
+        if (typeof vehController?.setLaneTrafficConfig === 'function') {
+            try { vehController.setLaneTrafficConfig(laneTrafficConfig); } catch (e) { console.warn("vehController.setLaneTrafficConfig failed:", e); }
         }
     }
 
     canvas.addEventListener('click', function(event) {
-        try {
-            const rect = canvas.getBoundingClientRect();
-            const x = event.clientX - rect.left;
-            const y = event.clientY - rect.top;
-            ["utara", "timur", "selatan", "barat"].forEach(arah => {
-                const positions = getLaneButtonPositions(ctx, config, arah) || [];
-                const targetSize = 25;
-                positions.forEach((pos, i) => {
-                    let finalWidth = targetSize, finalHeight = targetSize;
-                    const img = arrowImages[laneArrows[arah] && laneArrows[arah][i]];
-                    if (img && img.complete) {
-                        const aspectRatio = img.width / img.height || 1;
-                        if (arah === "selatan" || arah === "utara") { finalWidth = targetSize; finalHeight = finalWidth / aspectRatio; } else { finalHeight = targetSize; finalWidth = finalHeight * aspectRatio; }
-                    }
-                    const boxX = pos.x - finalWidth / 2;
-                    const boxY = pos.y - finalHeight / 2;
-                    if (x >= boxX && x <= boxX + finalWidth && y >= boxY && y <= boxY + finalHeight) {
-                        const currentType = laneArrows[arah][i];
-                        const currentIndex = arrowTypes.indexOf(currentType);
-                        const nextIndex = (currentIndex + 1) % arrowTypes.length;
-                        laneArrows[arah][i] = arrowTypes[nextIndex];
-                        drawLayout();
-                        if (typeof vehController?.setLaneCoordinates === 'function') vehController.setLaneCoordinates(laneCoordinates);
-                    }
-                });
+                try {
+                    const rect = canvas.getBoundingClientRect();
+                    const x = event.clientX - rect.left;
+                    const y = event.clientY - rect.top;
+                    ["utara", "timur", "selatan", "barat"].forEach(arah => {
+                        const positions = getLaneButtonPositions(ctx, config, arah) || [];
+                        const targetSize = 25;
+                        positions.forEach((pos, i) => {
+                            let finalWidth = targetSize, finalHeight = targetSize;
+                            const img = arrowImages[laneArrows[arah] && laneArrows[arah][i]];
+                            if (img && img.complete) {
+                                const aspectRatio = img.width / img.height || 1;
+                                if (arah === "selatan" || arah === "utara") { finalWidth = targetSize; finalHeight = finalWidth / aspectRatio; } else { finalHeight = targetSize; finalWidth = finalHeight * aspectRatio; }
+                            }
+                            const boxX = pos.x - finalWidth / 2;
+                            const boxY = pos.y - finalHeight / 2;
+                            if (x >= boxX && x <= boxX + finalWidth && y >= boxY && y <= boxY + finalHeight) {
+                                const currentType = laneArrows[arah][i];
+                                const currentIndex = arrowTypes.indexOf(currentType);
+                                const nextIndex = (currentIndex + 1) % arrowTypes.length;
+                                laneArrows[arah][i] = arrowTypes[nextIndex];
+                                drawLayout();
+                                if (typeof vehController?.setLaneCoordinates === 'function') vehController.setLaneCoordinates(laneCoordinates);
+                            }
+                        });
+                    });
+                } catch (e) {
+                    console.error("click handler failed:", e);
+                }
             });
-        } catch (e) {
-            console.error("click handler failed:", e);
-        }
-    });
 
+    // ... (Fungsi-fungsi intersect... tidak diubah) ...
     function intersectVerticalLineCircle(x0, cx, cy, r) {
         const dx = x0 - cx;
         const sq = r * r - dx * dx;
@@ -307,68 +760,50 @@ function init() {
         }
     }
 
-    /* ---------------------------
-        Draw entry lane numbers (BLUE) using getLaneButtonPositions
-    --------------------------- */
-    function drawEntryLaneNumbers(ctx, config) {
-        ctx.fillStyle = "blue";
-        ctx.font = "14px Arial";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-
-        const OFFSET = -40;
-
-        // ensure entry object exists
-        laneCoordinates.entry = laneCoordinates.entry || {};
-
-        // Jika terkunci dan ada cached snapshot, gunakan koordinat cached persis (restore draw)
-        if (laneCoordinatesLocked && initialLaneCoordinates && initialLaneCoordinates.entry) {
-            // clear then reapply cached
-            Object.keys(laneCoordinates.entry).forEach(k => delete laneCoordinates.entry[k]);
-            Object.keys(initialLaneCoordinates.entry).forEach(k => {
-                const p = initialLaneCoordinates.entry[k];
-                ctx.fillText(k.split('_')[1], p.x, p.y);
-                laneCoordinates.entry[k] = { x: p.x, y: p.y };
+    /* Draw entry lane numbers (BLUE) - unchanged except storing coords */
+        function drawEntryLaneNumbers(ctx, config) {
+            ctx.fillStyle = "blue";
+            ctx.font = "14px Arial";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            const OFFSET = -40;
+            laneCoordinates.entry = laneCoordinates.entry || {};
+            if (laneCoordinatesLocked && initialLaneCoordinates && initialLaneCoordinates.entry) {
+                Object.keys(laneCoordinates.entry).forEach(k => delete laneCoordinates.entry[k]);
+                Object.keys(initialLaneCoordinates.entry).forEach(k => {
+                    const p = initialLaneCoordinates.entry[k];
+                    ctx.fillText(k.split('_')[1], p.x, p.y);
+                    laneCoordinates.entry[k] = { x: p.x, y: p.y };
+                });
+                return;
+            }
+            ["utara", "timur", "selatan", "barat"].forEach(arah => {
+                Object.keys(laneCoordinates.entry).forEach(k => {
+                    if (k.startsWith(arah + "_")) delete laneCoordinates.entry[k];
+                });
             });
-            return;
+            ["utara", "timur", "selatan", "barat"].forEach(arah => {
+                const positions = getLaneButtonPositions(ctx, config, arah) || [];
+                positions.forEach((pos, i) => {
+                    let dx = 0, dy = 0;
+                    if (arah === 'utara') dy = -OFFSET;
+                    else if (arah === 'timur') dx = OFFSET;
+                    else if (arah === 'selatan') dy = OFFSET;
+                    else if (arah === 'barat') dx = -OFFSET;
+                    const finalX = pos.x + dx;
+                    const finalY = pos.y + dy;
+                    ctx.fillText(i + 1, finalX, finalY);
+                    laneCoordinates.entry[`${arah}_${i + 1}`] = { x: finalX, y: finalY };
+                });
+            });
         }
 
-        // --- CLEAR stale entry keys for each direction BEFORE drawing new ones ---
-        ["utara", "timur", "selatan", "barat"].forEach(arah => {
-            Object.keys(laneCoordinates.entry).forEach(k => {
-                if (k.startsWith(arah + "_")) delete laneCoordinates.entry[k];
-            });
-        });
-
-        ["utara", "timur", "selatan", "barat"].forEach(arah => {
-            const positions = getLaneButtonPositions(ctx, config, arah) || [];
-            positions.forEach((pos, i) => {
-                let dx = 0, dy = 0;
-                if (arah === 'utara') dy = -OFFSET;
-                else if (arah === 'timur') dx = OFFSET;
-                else if (arah === 'selatan') dy = OFFSET;
-                else if (arah === 'barat') dx = -OFFSET;
-
-                const finalX = pos.x + dx;
-                const finalY = pos.y + dy;
-                ctx.fillText(i + 1, finalX, finalY);
-
-                // SIMPAN KOORDINAT (baru)
-                laneCoordinates.entry[`${arah}_${i + 1}`] = { x: finalX, y: finalY };
-            });
-        });
-    }
-
-    /* ---------------------------
-        drawExitLaneNumbers LEFT AS IS (RED) but with cache support
-    --------------------------- */
+    /* drawExitLaneNumbers (unchanged logic) */
     function drawExitLaneNumbers(ctx, config) {
         ctx.fillStyle = "red";
         ctx.font = "14px Arial";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-
-        // Jika terkunci dan ada cached snapshot, gunakan koordinat cached persis (restore draw)
         if (laneCoordinatesLocked && initialLaneCoordinates && initialLaneCoordinates.exit) {
             Object.keys(laneCoordinates.exit).forEach(k => delete laneCoordinates.exit[k]);
             Object.keys(initialLaneCoordinates.exit).forEach(k => {
@@ -378,12 +813,10 @@ function init() {
             });
             return;
         }
-
         const skala = config.skala_px * 3;
         const centerX = ctx.canvas.width / 2;
         const centerY = ctx.canvas.height / 2;
         const radiusOffset = config.radiusValue * config.skala_px;
-
         const U_in_px = (config.utara.in || 0) * skala;
         const U_out_px = (config.utara.out || 0) * skala;
         const T_in_px = (config.timur.in || 0) * skala;
@@ -392,30 +825,22 @@ function init() {
         const S_out_px = (config.selatan.out || 0) * skala;
         const B_in_px = (config.barat.in || 0) * skala;
         const B_out_px = (config.barat.out || 0) * skala;
-
         const sq = radiusOffset || 0.0001;
         const c1 = { x: centerX - U_out_px - sq, y: centerY - B_in_px - sq, r: sq };
         const c2 = { x: centerX + U_in_px + sq, y: centerY - T_out_px - sq, r: sq };
         const c3 = { x: centerX + S_out_px + sq, y: centerY + T_in_px + sq, r: sq };
         const c4 = { x: centerX - S_in_px - sq, y: centerY + B_out_px + sq, r: sq };
         const circles = [c1, c2, c3, c4];
-
-        // ensure exit object exists
         laneCoordinates.exit = laneCoordinates.exit || {};
-
-        // --- CLEAR stale exit keys for each direction BEFORE drawing new ones ---
         ["utara", "timur", "selatan", "barat"].forEach(arah => {
             Object.keys(laneCoordinates.exit).forEach(k => {
                 if (k.startsWith(arah + "_")) delete laneCoordinates.exit[k];
             });
         });
-
-        // UTARA
-        {
+        { // UTARA
             const totalKeluar = config.utara.out || 0;
             const startY = 0;
             const endY_Keluar = centerY - (B_in_px) - radiusOffset;
-            
             for (let i = 0; i < totalKeluar; i++) {
                 const laneCenterX = centerX - (i + 0.5) * skala;
                 let candidateYs = [];
@@ -429,14 +854,10 @@ function init() {
                 const finalX = laneCenterX;
                 const finalY = visibleY + offsetY;
                 ctx.fillText(i + 1, finalX, finalY);
-
-                // SIMPAN KOORDINAT
                 laneCoordinates.exit[`utara_${i + 1}`] = { x: finalX, y: finalY };
             }
         }
-
-        // SELATAN
-        {
+        { // SELATAN
             const totalKeluar = config.selatan.out || 0;
             const startY_Keluar = centerY + (T_in_px) + radiusOffset;
             const endY = ctx.canvas.height;
@@ -453,18 +874,13 @@ function init() {
                 const finalX = laneCenterX;
                 const finalY = visibleY + offsetY;
                 ctx.fillText(i + 1, finalX, finalY);
-
-                // SIMPAN KOORDINAT
                 laneCoordinates.exit[`selatan_${i + 1}`] = { x: finalX, y: finalY };
             }
         }
-
-        // TIMUR
-        {
+        { // TIMUR
             const totalKeluar = config.timur.out || 0;
             const startX_Keluar = centerX + (config.utara.in * skala) + radiusOffset;
             const endX = ctx.canvas.width;
-
             for (let i = 0; i < totalKeluar; i++) {
                 const laneCenterY = centerY - (i + 0.5) * skala;
                 let candidateXs = [];
@@ -478,14 +894,10 @@ function init() {
                 const finalX = visibleX + offsetX;
                 const finalY = laneCenterY;
                 ctx.fillText(i + 1, finalX, finalY);
-
-                // SIMPAN KOORDINAT
                 laneCoordinates.exit[`timur_${i + 1}`] = { x: finalX, y: finalY };
             }
         }
-
-        // BARAT
-        {
+        { // BARAT
             const totalKeluar = config.barat.out || 0;
             const startX = 0;
             const endX_Keluar = centerX - (config.selatan.in * skala) - radiusOffset;
@@ -502,8 +914,6 @@ function init() {
                 const finalX = visibleX + offsetX;
                 const finalY = laneCenterY;
                 ctx.fillText(i + 1, finalX, finalY);
-
-                // SIMPAN KOORDINAT
                 laneCoordinates.exit[`barat_${i + 1}`] = { x: finalX, y: finalY };
             }
         }
@@ -551,7 +961,6 @@ function init() {
 
             try { lampu.draw(); } catch (e) { }
 
-            // Setelah pertama kali layout digambar dan laneCoordinates terisi, capture snapshot awal (sekali saja)
             if (!initialCaptured) {
                 const hasEntries = Object.keys(laneCoordinates.entry || {}).length > 0;
                 const hasExits = Object.keys(laneCoordinates.exit || {}).length > 0;
@@ -564,45 +973,72 @@ function init() {
                         barat: { in: config.barat.in, out: config.barat.out }
                     };
                     initialCaptured = true;
-                    // Jika slider saat ini sama dengan defaultRadius, lock immediately
                     const epsilon = 0.0001;
                     if (Math.abs(config.radiusValue - defaultRadius) < epsilon) {
                         laneCoordinatesLocked = true;
                     }
                 }
             }
-
         } catch (e) {
             console.error("drawLayout error:", e);
         }
     }
 
     // ---------- vehmov controller init (menggantikan spawn & vehicles lama) ----------
-    updateExitLaneNumbers(); // pastikan exitLaneNumbers terisi sebelum controller dibuat
+    updateExitLaneNumbers();
 
-    const vehController = createVehMovController({
-        config,
-        laneCoordinates,
-        exitLaneNumbers,
-        trafficConfig: configTraffic,
-        laneArrows, // <-- PENTING: kirim laneArrows agar vehmov bisa baca panah selatan
-        canvasSize: { width: canvas.width, height: canvas.height },
-        baseSpeed: 0.10
+    // inisialisasi laneTrafficConfig awal (bila belum ada)
+    buildDefaultLaneTrafficConfig();
+    readLaneTrafficInputs();
+    attachPerLaneInputListeners();
+
+    // --- NEW: listen for custom event dispatched by UI and for container input/change
+    document.addEventListener('laneInputsUpdated', () => {
+        try {
+            console.log('[main] laneInputsUpdated event received — re-reading per-lane inputs');
+            readLaneTrafficInputs();
+        } catch (e) {
+            console.warn('[main] readLaneTrafficInputs failed on laneInputsUpdated:', e);
+        }
     });
-
-        document.getElementById("resetBtn").addEventListener("click", () => {
-    if (vehController && typeof vehController.clearAllVehicles === "function") {
-        vehController.clearAllVehicles();
+    const laneContainerEl = document.getElementById('laneInputsContainer');
+    if (laneContainerEl) {
+        laneContainerEl.addEventListener('input', (e) => {
+            if (e.target && (e.target.matches('input') || e.target.matches('select'))) {
+                readLaneTrafficInputs();
+            }
+        });
+        laneContainerEl.addEventListener('change', (e) => {
+            if (e.target && (e.target.matches('input') || e.target.matches('select'))) {
+                readLaneTrafficInputs();
+            }
+        });
     }
-    });
+    // --- END NEW LISTENERS ---
 
-    // Immediately inform controller of computed laneCoordinates (drawLayout will populate laneCoordinates)
+    vehController = createVehMovController({
+            config,
+            laneCoordinates,
+            exitLaneNumbers,
+            trafficConfig: configTraffic,
+            laneTrafficConfig: laneTrafficConfig,
+            laneArrows,
+            canvasSize: { width: canvas.width, height: canvas.height },
+            baseSpeed: 0.10
+        });
+
+if (typeof vehController?.setLaneTrafficConfig === 'function') {
+        try { vehController.setLaneTrafficConfig(laneTrafficConfig); } catch (e) { console.warn("initial setLaneTrafficConfig failed:", e); }
+    }
+
+    const resetBtn = document.getElementById("resetBtn");
+    if (resetBtn) resetBtn.addEventListener("click", resetSimulation);
+
     drawLayout();
     if (typeof vehController.setLaneCoordinates === 'function') {
         vehController.setLaneCoordinates(laneCoordinates);
     }
 
-    // schedule initial spawns using controller
     ['utara','timur','selatan','barat'].forEach(arah => {
         vehController.scheduleNextSpawn(arah, performance.now());
     });
@@ -612,24 +1048,19 @@ function init() {
     function animate(timestamp) {
         const deltaTime = timestamp - lastTimestamp;
         lastTimestamp = timestamp;
-
+        // tick lampu dulu sehingga siklus membaca state yang paling up-to-date
         try { lampu.tick(deltaTime); } catch (e) { }
-
-        // 1) redraw layout (this updates laneCoordinates) -- draw functions respect laneCoordinatesLocked
+        if (siklus) {
+          siklus.update(deltaTime);
+          siklus.draw();
+        }
         drawLayout();
-
-        // keep controller informed (in case lanes changed interactively)
         if (typeof vehController.setLaneCoordinates === 'function') {
             vehController.setLaneCoordinates(laneCoordinates);
         }
-
-        // clear vehicle canvas
         vctx.clearRect(0, 0, vehicleCanvas.width, vehicleCanvas.height);
-
-        // optional: draw lane centers
         try { drawLaneCenters(vctx, config); } catch (e) { }
 
-        // spawn check via controller (nextSpawnTimes)
         for (const arah of ['utara','timur','selatan','barat']) {
             if (timestamp >= (vehController.nextSpawnTimes[arah] || 0)) {
                 vehController.spawnRandomVehicle(arah);
@@ -637,10 +1068,13 @@ function init() {
             }
         }
 
-        // 2) run car-following / antrian logic first (so it can set v.speed / commands)
+        // 2) run car-following / antrian logic
         try {
             const vehiclesBefore = vehController.getVehicles();
-            updateAntrian(vehiclesBefore, laneCoordinates, lampu, deltaTime, config.stopLine);
+            
+            // INI PENTING: 'config' yang berisi status switch diteruskan ke antrian.js
+            updateAntrian(vehiclesBefore, laneCoordinates, lampu, deltaTime, config, laneArrows);
+
         } catch (e) {
             console.warn("updateAntrian failed:", e);
         }
@@ -657,8 +1091,6 @@ function init() {
         vehiclesFromCtrl.forEach(vehicle => {
             vctx.save();
             vctx.translate(vehicle.x, vehicle.y);
-
-            // gunakan sudut dari vehmov.js
             if (typeof vehicle.angle === "number") {
                 vctx.rotate(vehicle.angle);
             } else {
@@ -666,34 +1098,27 @@ function init() {
                 else if (vehicle.direction === 'barat') vctx.rotate(Math.PI / 2);
                 else if (vehicle.direction === 'utara') vctx.rotate(Math.PI);
             }
-
             drawVehicle(vctx, { x: 0, y: 0, type: vehicle.type });
-               // --- Gambar ID kendaraan di atasnya ---
-                if (vehicle.id) {
-                    vctx.fillStyle = "yellow";       // warna teks
-                    vctx.font = "bold 12px Arial";   // jenis font
-                    vctx.textAlign = "center";       // rata tengah
-                    vctx.textBaseline = "bottom";    // posisi di atas
-                    
-                    // sesuaikan tinggi label berdasarkan tipe kendaraan
-                    let offset = 6;
-                    if (vehicle.type === "truk") offset = 10;
-                    else if (vehicle.type === "mobil") offset = 8;
-
-                    vctx.fillText(vehicle.id, 0, -vehicle.lengthPx / 2 - 6);
-                    // ↑ teks muncul di atas kendaraan (6px di atas sisi atas)
-                }
-                 vctx.restore();
+            if (vehicle.id) {
+                vctx.fillStyle = "yellow";
+                vctx.font = "bold 12px Arial";
+                vctx.textAlign = "center";
+                vctx.textBaseline = "bottom";
+                let offset = 6;
+                if (vehicle.type === "truk") offset = 10;
+                else if (vehicle.type === "mobil") offset = 8;
+                vctx.fillText(vehicle.id, 0, -vehicle.lengthPx / 2 - 6);
+            }
+            vctx.restore();
         });
 
-        // 5) DRAW DEBUG visuals from controller: paths, points, boxes
+        // 5) DRAW DEBUG visuals
         if (typeof vehController.drawDebugPaths === 'function') {
             try { vehController.drawDebugPaths(vctx); } catch (e) { console.warn("drawDebugPaths failed:", e); }
         }
         if (typeof vehController.drawDebugPoints === 'function') {
             try { vehController.drawDebugPoints(vctx); } catch (e) { console.warn("drawDebugPoints failed:", e); }
         }
-        // PENTING: gambar kotak debug di atas kendaraan
         if (typeof vehController.drawDebugBoxes === 'function') {
             try { vehController.drawDebugBoxes(vctx); } catch (e) { console.warn("drawDebugBoxes failed:", e); }
         }
@@ -701,10 +1126,9 @@ function init() {
         requestAnimationFrame(animate);
     }
 
-    // finalize init after images loaded
     Promise.all(loadImagePromises).then(() => {
         try {
-            updateConfig(); // will call drawLayout() and set laneCoordinates via setLaneCoordinates if available
+            updateConfig();
             try { lampu.updatePosition(config); } catch (e) { }
             requestAnimationFrame(animate);
         } catch (e) {
@@ -713,30 +1137,38 @@ function init() {
     });
 } // end init
 
-// Di dalam function animate(timestamp) { ... }
-const vehiclesFromCtrl = vehController.getVehicles();
-vehiclesFromCtrl.forEach(vehicle => {
-    vctx.save();
-    vctx.translate(vehicle.x, vehicle.y);
+function resetSimulation() {
+  console.log("🔄 Reset simulation triggered");
 
-    if (typeof vehicle.angle === "number") {
-        vctx.rotate(vehicle.angle);
-    } else {
-        if (vehicle.direction === 'timur') vctx.rotate(-Math.PI / 2);
-        else if (vehicle.direction === 'barat') vctx.rotate(Math.PI / 2);
-        else if (vehicle.direction === 'utara') vctx.rotate(Math.PI);
+  // 1️⃣ Reset kendaraan
+  if (vehController && typeof vehController.clearAllVehicles === "function") {
+    vehController.clearAllVehicles();
+    console.log("🚗 Semua kendaraan dihapus dari simulasi");
+  }
+
+  // 2️⃣ Reset lampu lalu lintas ke all-red
+  if (lampu && typeof lampu.resetAll === "function") {
+    lampu.resetAll();
+    lampu.draw();
+    console.log("🚦 Lampu lalu lintas direset ke all-red");
+  }
+
+  // 3️⃣ Reset diagram siklus (cycleCanvas)
+  if (siklus && typeof siklus.resetCycleDiagram === "function") {
+    siklus.resetCycleDiagram();
+    console.log("🔁 Diagram siklus di-reset ke fase awal");
+  }
+
+  // 4️⃣ Setelah 2 detik → aktifkan arah Utara (hijau)
+  setTimeout(() => {
+    if (lampu && typeof lampu.setCurrentDirection === "function") {
+      lampu.setCurrentDirection("utara");
+      lampu.draw();
+      console.log("🟢 Lampu utara menyala kembali (fase pertama)");
     }
+  }, 2000);
 
-    // Gambar kendaraan
-    drawVehicle(vctx, { x: 0, y: 0, type: vehicle.type });
+  console.log("✅ Reset selesai: kendaraan, lampu, dan diagram diulang dari awal.");
+}
 
-    // 🔹 Gambar ID kendaraan di atasnya
-    if (vehicle.id) {
-        vctx.fillStyle = "yellow";
-        vctx.font = "bold 12px Arial";
-        vctx.textAlign = "center";
-        vctx.fillText(vehicle.id, 0, -20);
-    }
 
-    vctx.restore();
-});
