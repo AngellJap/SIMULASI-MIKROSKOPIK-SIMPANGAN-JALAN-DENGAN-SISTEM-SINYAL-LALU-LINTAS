@@ -15,6 +15,9 @@ export function createVehMovController(options = {}) {
   const exitLaneNumbers = options.exitLaneNumbers || {};
   let trafficConfig = options.trafficConfig || {};
   const laneArrows = options.laneArrows || {};
+    // per-lane traffic config (opsional, dikirim dari main.js)
+  // Struktur: { utara: [{flow, motorPct, mobilPct, trukPct}, ...], timur: [...], selatan: [...], barat: [...] }
+  let laneTrafficConfig = options.laneTrafficConfig || { utara: [], timur: [], selatan: [], barat: [] };
   const canvasSize = options.canvasSize || { width: 800, height: 800 };
   const cx = canvasSize.width / 2;
   const cy = canvasSize.height / 2;
@@ -221,26 +224,80 @@ export function createVehMovController(options = {}) {
     return { p: { x: 0, y: 0 }, tan: { x: 0, y: 0 } };
   }
 
-  function buildPathFromSegments(segments) {
-    const segLens = segments.map(segmentLength);
-    const total = segLens.reduce((a, b) => a + b, 0);
+     function buildPathFromSegments(segments) {
+    // compute segment lengths (approx) AND build per-segment arc-length lookup tables
+    const segLens = [];
+    const segTables = [];
+    let total = 0;
+    for (let si = 0; si < segments.length; si++) {
+      const seg = segments[si];
+      // choose number of samples proportional to segment length (fallback to 40)
+      const approxLen = segmentLength(seg) || 0;
+      const samples = Math.max(12, Math.min(200, Math.round(approxLen / Math.max(1, DEFAULT_SAMPLE_SPACING_PX))));
+      // build arc-length table for this segment
+      const ts = [];
+      const arc = [];
+      let prev = segmentPointAndTangentAt(seg, 0).p;
+      let cum = 0;
+      ts.push(0); arc.push(0);
+      for (let k = 1; k <= samples; k++) {
+        const t = k / samples;
+        const pt = segmentPointAndTangentAt(seg, t).p;
+        const d = Math.hypot(pt.x - prev.x, pt.y - prev.y);
+        cum += d;
+        ts.push(t);
+        arc.push(cum);
+        prev = pt;
+      }
+      const segLen = cum;
+      segLens.push(segLen);
+      segTables.push({ ts, arc, segLen });
+      total += segLen;
+    }
     const cum = [];
     let s = 0;
     for (let i = 0; i < segLens.length; i++) { cum.push(s); s += segLens[i]; }
-    return { segments, segLens, totalLength: total, cumStart: cum };
+    return { segments, segLens, totalLength: total, cumStart: cum, segTables };
   }
 
-  function pathPointAndTangentAtDistance(path, dist) {
+    function pathPointAndTangentAtDistance(path, dist) {
     if (!path || path.totalLength <= 0) return { p: { x: 0, y: 0 }, tan: { x: 1, y: 0 } };
     const d = Math.max(0, Math.min(dist, path.totalLength));
+    // find segment index the same as previous logic
     let segIdx = path.segments.length - 1;
     for (let i = 0; i < path.segments.length; i++) {
-      if (d <= path.cumStart[i] + path.segLens[i] || i === path.segments.length - 1) { segIdx = i; break; }
+      if (d <= (path.cumStart[i] || 0) + (path.segLens[i] || 0) || i === path.segments.length - 1) { segIdx = i; break; }
     }
     const seg = path.segments[segIdx];
-    const segStart = path.cumStart[segIdx];
+    const segStart = path.cumStart[segIdx] || 0;
     const segLen = path.segLens[segIdx] || 1;
-    const t = segLen > 0 ? ((d - segStart) / segLen) : 0;
+    const localD = Math.max(0, Math.min(d - segStart, segLen));
+
+    // If we have a precomputed table, invert arc-length -> t using binary search + linear interp
+    if (path.segTables && path.segTables[segIdx]) {
+      const table = path.segTables[segIdx];
+      const arc = table.arc;
+      const ts = table.ts;
+      if (localD <= 0) return segmentPointAndTangentAt(seg, 0);
+      if (localD >= table.segLen) return segmentPointAndTangentAt(seg, 1);
+      // binary search first index with arc[idx] >= localD
+      let lo = 0, hi = arc.length - 1;
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (arc[mid] < localD) lo = mid + 1; else hi = mid;
+      }
+      const j = lo;
+      const a1 = (j > 0) ? arc[j - 1] : 0;
+      const a2 = arc[j];
+      const t1 = (j > 0) ? ts[j - 1] : 0;
+      const t2 = ts[j];
+      const frac = (a2 - a1) > 1e-9 ? ((localD - a1) / (a2 - a1)) : 0;
+      const t = Math.max(0, Math.min(1, t1 + (t2 - t1) * frac));
+      return segmentPointAndTangentAt(seg, t);
+    }
+
+    // fallback: proportional param (older behavior)
+    const t = segLen > 0 ? ((localD) / segLen) : 0;
     return segmentPointAndTangentAt(seg, Math.max(0, Math.min(1, t)));
   }
 
@@ -296,7 +353,7 @@ export function createVehMovController(options = {}) {
   }
   function dirFromKey(key) { if (!key || typeof key !== 'string') return null; return key.split('_')[0]; }
 
-  function findExitPoint(exitDir, preferredExitLaneIndex, fromLaneIndex) {
+   function findExitPoint(exitDir, preferredExitLaneIndex, fromLaneIndex) {
     const exitMap = laneCoordinates.exit || {};
     const keys = Object.keys(exitMap).filter(k => k.startsWith(exitDir + "_"));
     if (keys.length === 0) return null;
@@ -620,26 +677,71 @@ function spawnRandomVehicle(forcedDirection = null) {
   const laneCount = (config[arah] && config[arah].in) ? config[arah].in : 0;
   if (!laneCount) return null;
 
-  const truckPct = (trafficConfig[arah]?.truckPct ?? 20);
-  const rnd = Math.random() * 100;
-  let type = 'mobil';
-  if (rnd < truckPct) type = 'truk';
-  else if (rnd < truckPct + 30) type = 'motor';
+  // Pilih lajur — prefer per-lane flows jika tersedia
+  let laneIndex = Math.floor(Math.random() * laneCount);
+  let chosenLaneCfg = null;
+  try {
+    const lanesCfg = (laneTrafficConfig && laneTrafficConfig[arah] && laneTrafficConfig[arah].length) ? laneTrafficConfig[arah] : null;
+    if (lanesCfg && lanesCfg.length > 0) {
+      const totalFlow = lanesCfg.reduce((s, ln) => s + (Number(ln.flow) || 0), 0);
+      if (totalFlow > 0) {
+        // Weighted random berdasarkan flow per-lajur
+        let r = Math.random() * totalFlow;
+        let acc = 0;
+        for (let i = 0; i < lanesCfg.length; i++) {
+          acc += (Number(lanesCfg[i].flow) || 0);
+          if (r <= acc) { laneIndex = i; chosenLaneCfg = lanesCfg[i]; break; }
+        }
+        if (!chosenLaneCfg) { laneIndex = Math.min(laneIndex, lanesCfg.length - 1); chosenLaneCfg = lanesCfg[laneIndex]; }
+      } else {
+        // tidak ada flow per-lajur (all zero) -> fallback random
+        chosenLaneCfg = lanesCfg[laneIndex] || null;
+      }
+    }
+  } catch (e) {
+    chosenLaneCfg = null;
+  }
 
-  const laneIndex = Math.floor(Math.random() * laneCount);
+  // Pilih tipe kendaraan berdasarkan bobot per-lajur (jika ada), else fallback lama
+  let type = 'mobil';
+  if (chosenLaneCfg) {
+    const mPct = Number(chosenLaneCfg.motorPct) || 0;
+    const cPct = Number(chosenLaneCfg.mobilPct) || 0;
+    const tPct = Number(chosenLaneCfg.trukPct) || 0;
+    const rnd = Math.random() * 100;
+    if (rnd < mPct) type = 'motor';
+    else if (rnd < mPct + cPct) type = 'mobil';
+    else type = 'truk';
+  } else {
+    // legacy fallback (sebelum integrasi per-lajur)
+    const truckPct = (trafficConfig[arah]?.truckPct ?? 20);
+    const rnd = Math.random() * 100;
+    if (rnd < truckPct) type = 'truk';
+    else if (rnd < truckPct + 30) type = 'motor';
+    else type = 'mobil';
+  }
+
   const outChoices = exitLaneNumbers[arah] || [];
   const exitLane = outChoices.length > 0 ? outChoices[Math.floor(Math.random() * outChoices.length)] : null;
 
   const vehicle = createVehicle(arah, laneIndex, type, exitLane);
   return vehicle;
 }
-
   function scheduleNextSpawn(arah, currentTimeMs) {
-    const flow = (trafficConfig[arah]?.flow ?? 500);
-    const interval = getExponentialInterval(flow);
-    nextSpawnTimes[arah] = currentTimeMs + interval;
+  // Jika ada laneTrafficConfig → gunakan jumlah flow per-lajur (agregat) untuk menghitung interval
+  let flow = 0;
+  try {
+    if (laneTrafficConfig && laneTrafficConfig[arah] && laneTrafficConfig[arah].length > 0) {
+      flow = laneTrafficConfig[arah].reduce((s, ln) => s + (Number(ln.flow) || 0), 0);
+    }
+  } catch (e) {
+    flow = 0;
   }
-
+  // fallback ke trafficConfig arah
+  if (!flow || flow <= 0) flow = (trafficConfig[arah]?.flow ?? 500);
+  const interval = getExponentialInterval(flow);
+  nextSpawnTimes[arah] = currentTimeMs + interval;
+}
   // ---------- helper: compute & update debugBox data for a vehicle ----------
   // Now produces an oriented bounding box (corners), axes (unit normals), center, half-extents
   function computeDebugBoxForVehicle(v) {
@@ -1438,6 +1540,48 @@ function spawnRandomVehicle(forcedDirection = null) {
   function getVehicles() { return vehicles.slice(); }
   function clear() { vehicles.length = 0; nextId = 1; }
   function setTrafficConfig(obj) { trafficConfig = obj || trafficConfig; }
+    // Terima konfigurasi per-lajur dari main.js
+  // Terima konfigurasi per-lajur dari main.js
+  function setLaneTrafficConfig(obj) {
+    if (!obj) return;
+    try {
+      // shallow copy + sanitasi struktur
+      laneTrafficConfig = { utara: [], timur: [], selatan: [], barat: [] };
+      ['utara','timur','selatan','barat'].forEach(dir => {
+        if (!Array.isArray(obj[dir])) return;
+        laneTrafficConfig[dir] = obj[dir].map(l => {
+          // pastikan property tersedia, dan normalisasikan kecil (sum -> 100) kalau perlu
+          const flow = Math.max(0, Math.round(Number(l?.flow || 0)));
+          let m = Number(l?.motorPct ?? l?.motor ?? 0) || 0;
+          let c = Number(l?.mobilPct ?? l?.carPct ?? l?.mobil ?? 0) || 0;
+          let t = Number(l?.trukPct ?? l?.truckPct ?? l?.truk ?? 0) || 0;
+          const sum = m + c + t;
+          if (sum === 0) {
+            // fallback default
+            m = 33; c = 33; t = 34;
+          } else {
+            // normalize to percentages
+            m = (m / sum) * 100;
+            c = (c / sum) * 100;
+            t = (t / sum) * 100;
+            // pembulatan aman: pastikan integer dan jumlah = 100
+            let im = Math.round(m), ic = Math.round(c), it = Math.round(t);
+            const fix = 100 - (im + ic + it);
+            it += fix;
+            m = im; c = ic; t = it;
+          }
+          const motorPct = Math.max(0, Math.round(m));
+          const mobilPct = Math.max(0, Math.round(c));
+          const trukPct = Math.max(0, Math.round(t));
+          // provide aliases for compatibility
+          return { flow, motorPct, mobilPct, trukPct, carPct: mobilPct, truckPct: trukPct };
+        });
+      });
+      console.debug("vehmov: laneTrafficConfig set", laneTrafficConfig);
+    } catch (e) {
+      console.warn("setLaneTrafficConfig failed:", e);
+    }
+  }
   function setCanvasSize(sz) { if (sz?.width && sz?.height) { canvasSize.width = sz.width; canvasSize.height = sz.height; } }
 
   function setLaneCoordinates(newLc) {
@@ -1457,7 +1601,7 @@ function spawnRandomVehicle(forcedDirection = null) {
   return {
     spawnRandomVehicle, scheduleNextSpawn, update, getVehicles, clear, clearAllVehicles,
     nextSpawnTimes, setTrafficConfig, setCanvasSize,
-    drawDebugPoints, drawDebugPaths, drawDebugBoxes,
+    drawDebugPoints, drawDebugPaths, drawDebugBoxes, setLaneTrafficConfig,
     setLaneCoordinates
   };
 }
