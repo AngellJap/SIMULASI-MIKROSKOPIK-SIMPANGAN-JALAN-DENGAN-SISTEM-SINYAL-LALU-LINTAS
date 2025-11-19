@@ -1,4 +1,4 @@
-// antrian.js (revisi lengkap — robust LTOR lookup untuk lajur outermost + IDM/overlap + commit-on-yellow + held TL cap + accel cap)
+// antrian.js (revisi lengkap — robust LTOR lookup untuk lajur outermost + IDM/overlap + commit-on-yellow + held TL cap + accel/decel frame cap + hard-stop)
 // Catatan: updateAntrian signature kompatibel dengan main.js:
 // updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopLineCfg, laneArrows)
 // Keamanan: saya tidak menambahkan logging aktif kecuali pengecualian; jika mau debug, tambahkan console.debug di tempat yang diperlukan.
@@ -9,7 +9,7 @@ const DEFAULT_MIN_GAP_M = 2.0;
 
 const LASER_LENGTH_PX = 30;
 const LASER_SAFE_STOP_PX = 15;
-const SPAWN_GRACE_MS = 4500;
+const SPAWN_GRACE_MS = 0;
 
 const IDM_PARAMS = {
   a: 0.00018,
@@ -34,6 +34,11 @@ const YELLOW_COMMIT_DISTANCE_M = 4.0;
 const YELLOW_COMMIT_DISTANCE_PX = YELLOW_COMMIT_DISTANCE_M * PX_PER_M;
 const YELLOW_TIME_MARGIN_MS = 300;
 const YELLOW_MIN_SPEED_FOR_TIME_CHECK = 0.00005;
+
+// hard stop thresholds & tiny-speed floor
+const HARD_STOP_EXTRA_PX = 2; // extra margin to ensure full stop before line
+const STOP_SPEED_FLOOR = 1e-5; // anything below this is forced to zero
+const MIN_ZERO_HELD_TL = 0.0002; // held TL caps below this will be treated as zero
 
 function nowMs() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
 
@@ -432,77 +437,6 @@ function lookupLaneArrowValue(laneArrows, direction, laneIndex) {
   return arr;
 }
 
-// ---------------- MERGING UTILITIES ----------------
-// letakkan ini di atas (sebelum export function updateAntrian)
-function allowedLeftForActive(activeDir) {
-  // bila activeDir = arah yang sedang hijau (utara/timur/selatan/barat)
-  // return arah yang DIIZINKAN untuk belok kiri ketika merging = No & LTOR aktif
-  const map = {
-    utara: 'barat',   // utara hijau -> barat boleh belok kiri
-    timur: 'utara',   // timur hijau -> utara boleh belok kiri
-    selatan: 'timur', // selatan hijau -> timur boleh belok kiri
-    barat: 'selatan'  // barat hijau -> selatan boleh belok kiri
-  };
-  return map[activeDir] || null;
-}
-
-/**
- * hasMergingConflict
- * - currentDir: arah kendaraan (utara/timur/selatan/barat)
- * - movement: 'left'|'straight'|'right' (string)
- * - lampuObj: referensi object lampu (instance LampuLaluLintas) — untuk baca fase aktif
- * - cfg: config / stopLineCfg yang berisi merging (true/false) dan ltsorGlobal (LTOR)
- *
- * return true jika KONFLIK (=> harus diblok / berhenti)
- */
-function hasMergingConflict(currentDir, movement, lampuObj, cfg = {}) {
-  try {
-    // Jika merging diizinkan global => tidak ada konflik
-    if (cfg.merging !== false) return false;
-
-    // Jika bukan belok kiri, tidak ada konflik merging
-    if (!movement || movement !== 'left') return false;
-
-    // Hanya relevan jika LTOR aktif
-    const ltorActive = !!(cfg.ltsorGlobal || cfg.ltsor || cfg.ltor);
-    if (!ltorActive) return false;
-
-    // --- Tentukan arah aktif (lampu hijau) ---
-    let activeDir = null;
-    if (lampuObj) {
-      if (Array.isArray(lampuObj.urutan) && typeof lampuObj.indexAktif === 'number') {
-        activeDir = lampuObj.urutan[lampuObj.indexAktif];
-      }
-      if (!activeDir && lampuObj.currentDirection) activeDir = lampuObj.currentDirection;
-      if (!activeDir && lampuObj.status) {
-        for (const k of ['utara','timur','selatan','barat']) {
-          if (lampuObj.status[k] === 'hijau') { activeDir = k; break; }
-        }
-      }
-    }
-    if (!activeDir) return false;
-
-    // --- Aturan Merging=No (fase searah) ---
-    const allowedLeftTurn = {
-      utara: 'barat',   // utara hijau → barat boleh belok kiri
-      timur: 'utara',   // timur hijau → utara boleh belok kiri
-      selatan: 'timur', // selatan hijau → timur boleh belok kiri
-      barat: 'selatan'  // barat hijau → selatan boleh belok kiri
-    };
-
-    const allowed = allowedLeftTurn[activeDir];
-    if (!allowed) return false;
-
-    // Jika kendaraan bukan dari arah yang diizinkan, block (konflik)
-    if (currentDir !== allowed) return true;
-
-    return false;
-  } catch (e) {
-    console.warn("hasMergingConflict error:", e);
-    return false;
-  }
-}
-
 // ----------------- MAIN updateAntrian -----------------
 export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopLineCfg, laneArrows) {
   if (!vehicles || vehicles.length === 0) return;
@@ -512,18 +446,6 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
 
   // detect LTOR global flag (support several possible names)
   const ltorActive = !!(stopLineCfg && (stopLineCfg.ltsorGlobal || stopLineCfg.ltsor || stopLineCfg.ltor));
-
-// === MERGING LOGIC FIXED ===
-// Tentukan arah keluar untuk tiap pergerakan dari tiap lengan
-function getExitFor(dir, movement) {
-  const map = {
-    utara: { left: 'barat', straight: 'selatan', right: 'timur' },
-    timur: { left: 'utara', straight: 'barat', right: 'selatan' },
-    selatan: { left: 'timur', straight: 'utara', right: 'barat' },
-    barat: { left: 'selatan', straight: 'timur', right: 'utara' },
-  };
-  return map[dir]?.[movement] || null;
-}
 
   // prepare vehicles
   for (const v of vehicles) {
@@ -629,39 +551,6 @@ function getExitFor(dir, movement) {
         veh._idm.finalAllowedSpeed = finalAllowedSpeed;
 
         veh._idm.provisionalSpeed = finalAllowedSpeed;
-
-// ---------------- CEK MERGING (letakkan tepat di bawah provisionalSpeed assignment) ----------------
-try {
-  // pastikan kita punya info a
-  // rah & gerakan kendaraan
-  const currentDir = veh.direction || veh.entryDir;
-  const movement = (veh.movement || veh.route || 'left').toString().toLowerCase();
-
-  // pass lampu instance dan config (stopLineCfg yang diteruskan dari main.js ke updateAntrian)
-  // di file ini nama param biasanya stopLineCfg — jika beda, sesuaikan
-  const lampuObj = lampu; // variable lampu harus tersedia di scope updateAntrian
-  const cfg = stopLineCfg || {}; // stopLineCfg diteruskan saat updateAntrian(..., stopLineCfg, ...)
-
-  // Jika ada konflik merging dan kendaraan BELUM melewati entry (stopline),
-  // maka perlakukan seperti "diblok" (set allowed speed 0 & tandai enforcement)
-  if (hasMergingConflict(currentDir, movement, lampuObj, cfg)) {
-    // hanya block bila kendaraan belum melewati stopline (kita gunakan flag trafficLight.passedEntry)
-    const passedEntry = !!(veh._idm.trafficLight && veh._idm.trafficLight.passedEntry);
-    if (!passedEntry) {
-      veh._idm.tlAllowedSpeed = 0;
-      veh._idm.tlEnforced = true;
-      veh.speed = 0;
-      veh._idm.trafficLight = veh._idm.trafficLight || {};
-      veh._idm.trafficLight.reason = 'merge_blocked';
-      veh._idm._mergeBlocked = true;
-      // pastikan kita tidak melanjutkan pergerakan untuk kendaraan ini di frame ini
-      veh._idm.finalAllowedSpeed = 0;
-      continue; // lewati sisa update untuk veh ini
-    }
-  }
-} catch (e) {
-  console.warn("merge-check runtime error:", e);
-}
       }
     }
   }
@@ -859,29 +748,6 @@ try {
           if (typeof v._idm.tlAllowedSpeed !== 'number') v._idm.tlAllowedSpeed = v._idm._heldTlAllowed;
           else v._idm.tlAllowedSpeed = Math.min(v._idm.tlAllowedSpeed, v._idm._heldTlAllowed);
         }
-// === CEK MERGING (di bawah enforcement lampu, bukan di atas) ===
-try {
-  const arahKendaraan = v.direction;
-  const gerakan = (v.route || v.movement || 'straight').toString().toLowerCase(); // normalisasi
-  const cfg = stopLineCfg || {}; // pastikan config tersedia
-
-  // PENTING: oper lampu (object) dan cfg, bukan hanya nama arah
-  if (arahKendaraan && gerakan && hasMergingConflict(arahKendaraan, gerakan, lampu, cfg)) {
-    // 🚦 Berhenti total di belakang stop line jika merging = No dan kendaraan belum melewati entry
-    if (!v._idm.trafficLight.passedEntry) {
-      v._idm.tlAllowedSpeed = 0;
-      v._idm.tlEnforced = true;
-      v._idm.trafficLight = v._idm.trafficLight || {};
-      v._idm.trafficLight.reason = 'merge_blocked';
-      v._idm._mergeBlocked = true;
-      // pastikan kendaraan tidak maju di frame ini
-      v._idm.finalAllowedSpeed = 0;
-      continue;
-    }
-  }
-} catch (e) {
-  console.warn('Merging check error', e);
-}
       }
     }
   } catch (e) {
@@ -1061,13 +927,46 @@ try {
 
     final = Math.max(0, final);
 
+    // apply held TL cap if present (but if it's extremely small, treat as zero)
     if (typeof v._idm._heldTlAllowed === 'number') {
-      final = Math.min(final, v._idm._heldTlAllowed);
+      const held = v._idm._heldTlAllowed;
+      if (held < MIN_ZERO_HELD_TL) {
+        final = 0;
+      } else {
+        final = Math.min(final, held);
+      }
     }
 
-    const MAX_FRAME_ACCEL = (IDM_PARAMS.a * 4.0) * (deltaTime);
     const currentSpeed = (typeof v.speed === 'number') ? v.speed : 0;
-    final = Math.min(final, currentSpeed + Math.max(0, MAX_FRAME_ACCEL));
+
+    // frame-based accel/decel caps (allow both decel and accel per frame)
+    const MAX_FRAME_ACCEL_UP = (IDM_PARAMS.a * 4.0) * (deltaTime);
+    const MAX_FRAME_DECEL_UP = (b * 6.0) * (deltaTime); // positive magnitude for decel per frame
+
+    // allow reducing speed rapidly (deceleration) up to MAX_FRAME_DECEL_UP
+    const maxDown = Math.max(0, currentSpeed - MAX_FRAME_DECEL_UP);
+    const maxUp = currentSpeed + Math.max(0, MAX_FRAME_ACCEL_UP);
+
+    // clamp final to [maxDown, maxUp]
+    final = Math.min(final, maxUp);
+    final = Math.max(final, maxDown);
+
+    // HARD STOP enforcement: if TL demands a red stop and vehicle is very close to entry, force exact zero
+    if (v._idm.trafficLight && v._idm.trafficLight.enforced && v._idm.trafficLight.reason === 'red_stop' && typeof v._idm.trafficLight.frontDist === 'number') {
+      const hardDist = LASER_SAFE_STOP_PX + SAFETY_BUFFER_PX + HARD_STOP_EXTRA_PX;
+      if (v._idm.trafficLight.frontDist <= hardDist) {
+        final = 0;
+        v._idm.trafficLight.hardStopped = true;
+      }
+    }
+
+    // also if laser says stop (very close object) force zero
+    if (v._idm.laser && v._idm.laser.hit && typeof v._idm.laser.hits?.[0]?.dist === 'number') {
+      if (v._idm.laser.hits[0].dist <= LASER_SAFE_STOP_PX + HARD_STOP_EXTRA_PX) final = 0;
+    }
+
+    // tiny-floor: remove creeping numerical tiny speeds
+    if (final <= STOP_SPEED_FLOOR) final = 0;
 
     v.speed = final;
     v._idm.finalAppliedSpeed = final;
