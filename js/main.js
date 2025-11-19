@@ -19,6 +19,8 @@ import { drawLaneCenters, drawVehicle } from "./vehicle.js";
 import { createVehMovController } from './vehmov.js'; // <-- controller baru
 import { updateAntrian } from './antrian.js';
 import createSiklusLampu from './SiklusLampu.js';
+import { initSummary, updateSummaryTable } from './Summary.js';
+import { SpeedLogger } from "./SpeedLogger.js";
 
 document.addEventListener('DOMContentLoaded', init);
 
@@ -30,6 +32,15 @@ let lastTimestamp = 0;
 let running = false;
 let simSpeed = 1;
 let phaseMode = "searah"; // default
+
+window.exportSpeedData = () => {
+    const out = SpeedLogger.getFinished();
+    console.log("HASIL KECEPATAN:", out);
+    return out;
+};
+setInterval(() => {
+    console.log("Speed log:", SpeedLogger.getFinished());
+}, 5000);
 
 // Objek untuk menyimpan koordinat lajur masuk dan keluar
 const laneCoordinates = {
@@ -46,6 +57,23 @@ let laneTrafficConfig = {
     barat: []
 };
 // ---------------------------------------------------------------------
+
+function generateSpeedTables() {
+    const speedContainer = document.getElementById("speed-table-container");
+    if (!speedContainer) return;
+
+    // Ambil data kendaraan yang sudah keluar dari canvas
+    const tables = SpeedLogger.getFinished();
+
+    // Bangun tabel kecepatan
+    buildSpeedTables(speedContainer, finished, {
+        pxPerMeter: 10,      // ganti sesuai sistem kamu
+        sampleCount: 10
+    });
+
+    // Tambahkan tombol CSV & XLS otomatis
+    autoAttachExportButtons(speedContainer);
+}
 
 function init() {
     const canvas = document.getElementById('simCanvas');
@@ -234,6 +262,35 @@ function setActivePhaseButton(mode) {
         const el = $(id);
         if (el) el.addEventListener('change', updateConfig);
     });
+
+    // ==================== MERGING SWITCH HANDLER ====================
+// Sinkronkan nilai toggle Merging (Yes/No) ke config.merging global
+const mergingEl = document.getElementById("mergingSwitch");
+if (mergingEl) {
+  // nilai awal (default Yes bila checked)
+  config.merging = mergingEl.checked ?? true;
+
+  console.log(`[init] merging = ${config.merging ? "Yes" : "No"}`);
+
+  mergingEl.addEventListener("change", () => {
+    config.merging = mergingEl.checked;
+    if (config.merging) {
+      console.log("[UI] Merging = Yes → kendaraan boleh bertemu di jalur keluar yang sama");
+    } else {
+      console.log("[UI] Merging = No → kendaraan dari arah berbeda ditahan di belakang stop line");
+    }
+  });
+}
+
+// Pastikan LTOR global juga tersinkron (jika ada di UI)
+const ltorEl = document.getElementById("ltorGlobalSwitch");
+if (ltorEl) {
+  config.ltorGlobal = ltorEl.checked ?? true;
+  ltorEl.addEventListener("change", () => {
+    config.ltorGlobal = ltorEl.checked;
+    console.log(`[UI] LTOR Global = ${config.ltorGlobal ? "Aktif" : "Nonaktif"}`);
+  });
+}
 
     const radiusSlider = $('customRange');
     const radiusValueDisplay = $('rangeVal');
@@ -1126,15 +1183,26 @@ if (typeof vehController?.setLaneTrafficConfig === 'function') {
         requestAnimationFrame(animate);
     }
 
-    Promise.all(loadImagePromises).then(() => {
+Promise.all(loadImagePromises).then(() => {
+    try {
+        updateConfig();
+
+        // <-- PASANG INI: inisialisasi modul Summary (tambah setelah updateConfig)
         try {
-            updateConfig();
-            try { lampu.updatePosition(config); } catch (e) { }
-            requestAnimationFrame(animate);
+          // inisialisasi ke elemen #summary-root
+          initSummary('summary-root');
+          // lakukan update awal (optional: pass config jika ingin)
+          updateSummaryTable(config);
         } catch (e) {
-            console.error("Initialization error:", e);
+          console.warn("Summary init/update failed:", e);
         }
-    });
+
+        try { lampu.updatePosition(config); } catch (e) { }
+        requestAnimationFrame(animate);
+    } catch (e) {
+        console.error("Initialization error:", e);
+    }
+});
 } // end init
 
 function resetSimulation() {
@@ -1171,4 +1239,4 @@ function resetSimulation() {
   console.log("✅ Reset selesai: kendaraan, lampu, dan diagram diulang dari awal.");
 }
 
-
+setInterval(generateSpeedTables, 1000);
