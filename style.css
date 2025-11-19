@@ -126,7 +126,7 @@ h1 {
 .summary-panel {
   position: absolute;
   right: 25px;
-  top: 700px;
+  padding: 20px;
   width: 500px;
   background: ##4CAF50;
   border: 1px solid #aaa;
@@ -145,9 +145,12 @@ h1 {
 
 #cycleCanvas {
   background: transparent;
-  border: 1px solid rgba(255,255,255,0.2);
+  border: 1px solid rgba(156, 39, 39, 0.422);
   border-radius: 180px;
-  margin-top: 900px;
+  margin-top: 485px;
+  margin-left: -595px;
+  position: relative;
+  z-index: 99999999999;
 }
 
 .model-fase-container {
@@ -258,3 +261,46 @@ html, body {
   background-color: #00b894;
   color: white;
 }
+
+/* === Summary Table Styling (new) === */
+#summary-root {
+    width: 1500px;
+    height: 800px;
+    background: #2e6b3c27;
+    padding: 5px;
+    border-radius: 8px;
+    margin-top: 100px;
+    color: white;
+}
+
+<style>
+  #speed-panel table {
+    border-collapse: collapse;
+    margin-bottom: 25px;
+    width: 100%;
+    background: white;
+  }
+  #speed-panel th, #speed-panel td {
+    border: 1px solid #ccc;
+    padding: 4px 6px;
+    text-align: center;
+  }
+  #speed-panel th {
+    background: #f0f0f0;
+  }
+  .export-buttons {
+    margin-bottom: 5px;
+    display: flex;
+    gap: 6px;
+  }
+  .export-buttons button {
+    padding: 4px 8px;
+    border-radius: 6px;
+    border: 1px solid #888;
+    background: #eee;
+    cursor: pointer;
+  }
+  .export-buttons button:hover {
+    background: #ddd;
+  }
+</style>
