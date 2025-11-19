@@ -111,7 +111,7 @@
       <div class="model-fase-buttons">
         <button class="fase-btn" id="fase-searah" title="Searah Jarum Jam"><img src="logo/searah.png" alt="Searah Jarum Jam"></button>
         <button class="fase-btn" id="fase-berhadapan" title="Berhadapan"><img src="logo/berhadapan.png" alt="Berhadapan"></button>
-        <button class="fase-btn" id="fase-berseberangan" title="Berseberangan"><img src="logo/berseberangan.png" alt="Berseberangan"></button>
+        <button class="fase-btn" id="fase-berseberangan" title="Bersampingan"><img src="logo/berseberangan.png" alt="Berseberangan"></button>
       </div>
 
       <script>
@@ -236,10 +236,11 @@
         <button id="resetBtn" class="reset-btn" title="Reset Kendaraan">⟳</button>
         <div class="cycle-container">
           <canvas id="cycleCanvas" width="300" height="300"></canvas>
-          <h3>Diagram Siklus Lampu</h3>
         </div>
       </div>
     </div>
+    <!-- TABEL SUMMARY DITAMBAHKAN DI SINI (TIDAK MENGGANGGU YANG ADA) -->
+<div id="summary-root" style="margin-top:20px;"></div>
 
     <style>
       .reset-btn {
@@ -306,11 +307,11 @@
 
       <h3>Merging</h3>
       <div class="merging-container">
-        <span style="font-weight:bold;">Yes</span>
+        <span style="font-weight:bold;">No</span>
         <label class="switch">
           <input type="checkbox" id="mergingSwitch"><span class="slider round"></span>
         </label>
-        <span style="font-weight:bold;">No</span>
+        <span style="font-weight:bold;">Yes</span>
       </div>
 
       <div class="panel simspeed-panel">
@@ -705,6 +706,11 @@
         updateSummaryTable();
       })();
     </script>
+  
+<div id="speed-table-container"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<button id="btnDownloadZip">Download Semua Speed CSV (ZIP)</button>
+
 
     <!-- efek LTOR (tetap) -->
     <script>
