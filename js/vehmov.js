@@ -8,6 +8,7 @@
 // - drawDebugPoints sekarang menampilkan titik biru di setiap corner debugBox untuk verifikasi
 // - TAMBAH: perimeterSamples & centerlineSamples disimpan di v.debugBox untuk tiap kendaraan
 // - TAMBAH: Laser depan (v._laser) diupdate setiap frame dan digambar di debug
+import { SpeedLogger } from "./SpeedLogger.js";
 
 export function createVehMovController(options = {}) {
   const config = options.config || {};
@@ -37,7 +38,14 @@ export function createVehMovController(options = {}) {
   const AUTO_ROTATE_SYMMETRIC_BOX = (typeof options.autoRotateSymmetricBox === 'boolean') ? options.autoRotateSymmetricBox : true;
 
   // spawn margin (berapa jauh dari tepi canvas kendaraan mulai)
-  const SPAWN_MARGIN = (typeof options.spawnMargin === 'number') ? options.spawnMargin : 200;
+  const SPAWN_MARGIN = (typeof options.spawnMargin === 'number') ? options.spawnMargin : 1500;
+
+  // minimum spawn interval (ms). default 3000 ms (3s). Can be overridden via options.minSpawnIntervalSec or options.minSpawnIntervalMs
+  let _minSpawnIntervalMs = (typeof options.minSpawnIntervalMs === 'number') ? Math.max(0, Math.round(options.minSpawnIntervalMs)) : ((typeof options.minSpawnIntervalSec === 'number') ? Math.max(0, Math.round(options.minSpawnIntervalSec * 1000)) : 3500);
+
+  function setMinSpawnIntervalSec(sec) { _minSpawnIntervalMs = Math.max(0, Math.round(Number(sec) * 1000)); }
+  function getMinSpawnIntervalSec() { return _minSpawnIntervalMs / 1000; }
+
 
   // ---------- Laser config (dapat di-override via options) ----------
   const LASER_LENGTH_PX = (typeof options.laserLengthPx === 'number') ? options.laserLengthPx : 30;
@@ -91,7 +99,9 @@ export function createVehMovController(options = {}) {
     if (!flowPerHour || flowPerHour <= 0) return Infinity;
     const meanSeconds = 3600 / flowPerHour;
     const u = Math.random();
-    return -Math.log(1 - u) * meanSeconds * 1000;
+    const sampledMs = -Math.log(1 - u) * meanSeconds * 1000;
+    // enforce minimum spawn interval
+    return Math.max(sampledMs, _minSpawnIntervalMs);
   }
 
   function spawnPositionFor(arah, laneIndexZeroBased) {
@@ -866,6 +876,7 @@ function spawnRandomVehicle(forcedDirection = null) {
     v._laser.right = v._laser.right || {};
     v._laser.center.hit = false; v._laser.left.hit = false; v._laser.right.hit = false;
     v._laser.center.hitId = null; v._laser.left.hitId = null; v._laser.right.hitId = null;
+try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
 
     // Determine forward unit vector (prefer axle vector front - rear, then vx/vy, then angle)
     let ux = 1, uy = 0;
@@ -1292,6 +1303,7 @@ function spawnRandomVehicle(forcedDirection = null) {
         v.x += (v.vx || 0) * move;
         v.y += (v.vy || 0) * move;
         moveBudget = 0;
+        SpeedLogger.logFrame(v, PX_PER_M);
 
         // sync axles/poros berdasarkan heading dari vx/vy (atau v.angle)
         if ((v.vx || 0) !== 0 || (v.vy || 0) !== 0) {
@@ -1327,6 +1339,7 @@ function spawnRandomVehicle(forcedDirection = null) {
       // remove if out of canvas bounds (with margin)
       const margin = SPAWN_MARGIN + 60;
       if (v.x < -margin || v.x > canvasSize.width + margin || v.y < -margin || v.y > canvasSize.height + margin) {
+        try { SpeedLogger.finalizeVehicle(v, PX_PER_M); } catch (e) {}
         vehicles.splice(i, 1);
       }
     } // end per-vehicle movement
@@ -1602,6 +1615,8 @@ function spawnRandomVehicle(forcedDirection = null) {
     spawnRandomVehicle, scheduleNextSpawn, update, getVehicles, clear, clearAllVehicles,
     nextSpawnTimes, setTrafficConfig, setCanvasSize,
     drawDebugPoints, drawDebugPaths, drawDebugBoxes, setLaneTrafficConfig,
-    setLaneCoordinates
+    setLaneCoordinates,
+    // min spawn interval control (seconds)
+    setMinSpawnIntervalSec, getMinSpawnIntervalSec
   };
 }
