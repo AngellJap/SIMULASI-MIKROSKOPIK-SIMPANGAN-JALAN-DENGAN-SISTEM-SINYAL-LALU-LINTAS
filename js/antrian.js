@@ -1,16 +1,17 @@
-// antrian.js (revisi lengkap — robust LTOR lookup untuk lajur outermost + IDM/overlap + commit-on-yellow + held TL cap + accel/decel frame cap + hard-stop)
-// Catatan: updateAntrian signature kompatibel dengan main.js:
-// updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopLineCfg, laneArrows)
-// Keamanan: saya tidak menambahkan logging aktif kecuali pengecualian; jika mau debug, tambahkan console.debug di tempat yang diperlukan.
-
+// antrian.js (REVISI LOGIKA BARU: Flow & Queue Real-Time)
+// Fitur Baru:
+// 1. Antrian dihitung dari Bumper Depan kendaraan terdepan s/d Bumper Belakang kendaraan terakhir.
+// 2. Mendukung toleransi 'Merayap' (Creep), tidak harus 0 absolute.
+// 3. Mengabaikan kendaraan yang baru spawn (proteksi area radar).
 const PX_PER_M = 10;
 const DEFAULT_VEHICLE_LENGTH_M = 4.5;
 const DEFAULT_MIN_GAP_M = 2.0;
 
 const LASER_LENGTH_PX = 30;
 const LASER_SAFE_STOP_PX = 15;
-const SPAWN_GRACE_MS = 0;
+const SPAWN_GRACE_MS = 0; // Digantikan logic khusus di stats
 
+// Parameter Fisika IDM
 const IDM_PARAMS = {
   a: 0.00018,
   b: 0.00035,
@@ -29,16 +30,32 @@ const TL_COMFORT_DECEL = 0.0006;
 const TL_RAMP_EXP = 1.6;
 const TL_MIN_VSNAP = 0.0005;
 
-// yellow commit tuning
+// Tuning Lampu Kuning & Hard Stop
 const YELLOW_COMMIT_DISTANCE_M = 4.0;
 const YELLOW_COMMIT_DISTANCE_PX = YELLOW_COMMIT_DISTANCE_M * PX_PER_M;
 const YELLOW_TIME_MARGIN_MS = 300;
 const YELLOW_MIN_SPEED_FOR_TIME_CHECK = 0.00005;
 
-// hard stop thresholds & tiny-speed floor
-const HARD_STOP_EXTRA_PX = 2; // extra margin to ensure full stop before line
-const STOP_SPEED_FLOOR = 1e-5; // anything below this is forced to zero
-const MIN_ZERO_HELD_TL = 0.0002; // held TL caps below this will be treated as zero
+
+const HARD_STOP_EXTRA_PX = 2;
+const STOP_SPEED_FLOOR = 1e-5;
+const MIN_ZERO_HELD_TL = 0.0002;
+
+// ==========================================
+// KONFIGURASI DETEKSI ANTRIAN (STATS)
+// ==========================================
+// Kecepatan di bawah ini dianggap "Berhenti/Merayap" (0.02 px/ms ~= 7 km/h)
+const QUEUE_SPEED_TOLERANCE = 0.02; 
+
+// Jarak maksimal moncong kendaraan pertama dari garis stop agar dianggap antri (20 meter)
+const QUEUE_START_LIMIT_PX = 200; 
+
+// Jarak gap maksimal antar kendaraan agar dianggap satu rangkaian antrian (5 meter)
+const QUEUE_MAX_CHAIN_GAP_PX = 50; 
+
+// Waktu pengabaian awal spawn agar tidak terhitung sebagai antrian (2000ms = 2 detik)
+// Ini berfungsi sebagai "Radar" pengaman di area spawn.
+const SPAWN_IGNORE_QUEUE_MS = 2000; 
 
 function nowMs() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
 
@@ -193,7 +210,7 @@ function shiftedDebugBox(db, dx, dy) {
   return { corners, center: { x: db.center.x + dx, y: db.center.y + dy }, angle: db.angle, halfExtents: db.halfExtents };
 }
 
-// computeMaxNonOverlapScale using path tangent axis (avoid stale vx/vy)
+
 function computeMaxNonOverlapScale(follower, leader, dt) {
   if (!follower || !leader || !follower.debugBox || !leader.debugBox) return 1.0;
 
@@ -223,7 +240,7 @@ function computeMaxNonOverlapScale(follower, leader, dt) {
   return Math.max(0, Math.min(1, best));
 }
 
-// --- REVISED computeLongitudinalGapUsingSamples: robust terhadap tikungan radius kecil
+
 function computeLongitudinalGapUsingSamples(follower, leader) {
   if (!follower) return 1e9;
   if (!leader) return 1e9;
@@ -385,8 +402,8 @@ function signedDistFrontToEntryAlongHeading(v, entry) {
   return dx * heading.x + dy * heading.y;
 }
 
-// ----------------- Robust laneArrow lookup helper -----------------
-// Tries multiple heuristics to find the arrow value for (direction, laneIndex).
+
+
 function lookupLaneArrowValue(laneArrows, direction, laneIndex) {
   if (!laneArrows) return null;
   const tryKeys = [direction, String(direction), direction?.toLowerCase?.(), direction?.toUpperCase?.()].filter(Boolean);
@@ -405,11 +422,11 @@ function lookupLaneArrowValue(laneArrows, direction, laneIndex) {
   if (Array.isArray(arr)) {
     const candidates = [];
     if (idx !== null) {
-      candidates.push(idx);                       // 0-based
-      candidates.push(idx - 1);                   // laneIndex may be 1-based
-      candidates.push(idx + 1);                   // offset variant
-      candidates.push(arr.length - 1 - idx);      // reversed order
-      candidates.push(arr.length - idx);          // reversed + 1-based
+      candidates.push(idx);                       
+      candidates.push(idx - 1);                   
+      candidates.push(idx + 1);                   
+      candidates.push(arr.length - 1 - idx);      
+      candidates.push(arr.length - idx);          
       candidates.push(arr.length - 1 - (idx - 1));
     }
     candidates.push(0); candidates.push(arr.length - 1);
@@ -433,7 +450,6 @@ function lookupLaneArrowValue(laneArrows, direction, laneIndex) {
     for (const k in arr) { if (arr[k] != null) return arr[k]; }
     return null;
   }
-
   return arr;
 }
 
@@ -443,11 +459,8 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
   if (deltaTime <= 0) return;
 
   const now = nowMs();
-
-  // detect LTOR global flag (support several possible names)
   const ltorActive = !!(stopLineCfg && (stopLineCfg.ltsorGlobal || stopLineCfg.ltsor || stopLineCfg.ltor));
 
-  // prepare vehicles
   for (const v of vehicles) {
     if (!v) continue;
     fallbackSetDesiredSpeedIfMissing(v);
@@ -463,12 +476,7 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
     ensureSamplesForVehicle(v, { centerSamples: 11, perEdge: 10 });
   }
 
-  for (const v of vehicles) {
-    if (!v || !v.debugBox) continue;
-    ensureSamplesForVehicle(v, { centerSamples: 11, perEdge: 10 });
-  }
-
-  // lane grouping
+  // Lane Grouping
   const lanes = { utara: {}, timur: {}, selatan: {}, barat: {} };
   for (const v of vehicles) {
     if (!v || !v.direction || v.laneIndex == null) continue;
@@ -535,36 +543,42 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
         let finalAllowedSpeed = Math.max(0, Math.min(cappedSpeed, maxAllowedSpeed));
         if (gap <= SAFETY_BUFFER_PX * 0.5) finalAllowedSpeed = 0;
 
-        // diagnostics
-        veh._idm.acc = acc;
-        veh._idm.gap = gap;
-        veh._idm.s_star = s_star;
-        veh._idm.v = currentV;
-        veh._idm.v0 = v0;
-        veh._idm.deltaV = deltaV;
-        veh._idm.leaderId = leader ? leader.id : null;
-        veh._idm.leaderSpeed = leader ? leader.speed : null;
-        veh._idm.leaderMove = leaderMove;
-        veh._idm.maxMoveAllowed = maxMoveAllowed;
-        veh._idm.maxAllowedSpeed = maxAllowedSpeed;
-        veh._idm.cappedSpeed = cappedSpeed;
-        veh._idm.finalAllowedSpeed = finalAllowedSpeed;
-
         veh._idm.provisionalSpeed = finalAllowedSpeed;
       }
     }
   }
 
-  // ----------------- TRAFFIC LIGHT ENFORCEMENT (passedEntry + commit-on-yellow + held cap) -----------------
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  // ----------------- TRAFFIC LIGHT ENFORCEMENT -----------------
   try {
     if (lampu && laneCoordinates && laneCoordinates.entry) {
 
       function getYellowTimeLeftMs(lampuObj, direction) {
         if (!lampuObj) return null;
         if (lampuObj.timeLeft && typeof lampuObj.timeLeft[direction] === 'number') return lampuObj.timeLeft[direction];
-        if (lampuObj.remaining && typeof lampuObj.remaining[direction] === 'number') return lampuObj.remaining[direction];
-        if (lampuObj.timeRemaining && typeof lampuObj.timeRemaining[direction] === 'number') return lampuObj.timeRemaining[direction];
-        if (lampuObj.timers && lampuObj.timers[direction] && typeof lampuObj.timers[direction].remaining === 'number') return lampuObj.timers[direction].remaining;
         return null;
       }
 
@@ -575,21 +589,19 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
 
         if (typeof v._idm._heldTlAllowed === 'undefined') v._idm._heldTlAllowed = undefined;
 
+        // Skip enforcement if just spawned (prevent immediate stop on edge)
         if (v.createdAt && (now - v.createdAt) < SPAWN_GRACE_MS) {
           v._idm.trafficLight.skipped = true;
           v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
           v._idm.tlEnforced = false;
-          v._idm._heldTlAllowed = undefined;
           continue;
         }
 
         const entryKey = `${v.direction}_${v.laneIndex}`;
         const entry = laneCoordinates.entry ? laneCoordinates.entry[entryKey] : null;
         if (!entry) {
-          v._idm._heldTlAllowed = undefined;
           v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
           v._idm.tlEnforced = false;
-          v._idm.trafficLight.stopMode = undefined;
           continue;
         }
 
@@ -602,18 +614,16 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
           const rear = getVehicleRearPoint(v);
           if (rear) {
             let heading = null;
-            if (v.debugBox && typeof v.debugBox.angle === 'number') {
+             if (v.debugBox && typeof v.debugBox.angle === 'number') {
               heading = { x: Math.cos(v.debugBox.angle), y: Math.sin(v.debugBox.angle) };
-            } else if (Array.isArray(v.debugBox?.centerlineSamples) && v.debugBox.centerlineSamples.length >= 2) {
-              const cl = v.debugBox.centerlineSamples;
-              heading = normalizeVec({ x: cl[cl.length - 1].x - cl[0].x, y: cl[cl.length - 1].y - cl[0].y });
+            } else if (typeof v.frontX === 'number' && typeof v.rearX === 'number') {
+              heading = normalizeVec({ x: v.frontX - v.rearX, y: v.frontY - v.rearY });
             }
             if (heading) {
               const dxr = entry.x - rear.x, dyr = entry.y - rear.y;
               const signedRear = dxr * heading.x + dyr * heading.y;
               if (signedRear <= 0) {
                 v._idm.trafficLight.committedOnYellow = false;
-                v._idm.trafficLight.committedReleasedAt = now;
                 v._idm._heldTlAllowed = undefined;
               }
             }
@@ -624,12 +634,10 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
 
         if (light === 'merah' && v._idm.trafficLight.committedOnYellow && !v._idm.trafficLight.passedEntry) {
           v._idm.trafficLight.committedOnYellow = false;
-          v._idm.trafficLight.committedRevokedAt = now;
         }
 
         if (v._idm.trafficLight.passedEntry || v._idm.trafficLight.committedOnYellow) {
           v._idm.trafficLight.enforced = false;
-          v._idm.trafficLight.reason = v._idm.trafficLight.passedEntry ? 'already_past_entry' : 'committed_on_yellow';
           v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
           v._idm.tlEnforced = false;
           if (v._idm.trafficLight.passedEntry) v._idm._heldTlAllowed = undefined;
@@ -646,28 +654,29 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
         const dist = Math.hypot(dx, dy);
         v._idm.trafficLight.frontDist = dist;
 
-        // ---------- LTOR bypass (robust lookup) ----------
-        v._idm.trafficLight.ltorMatch = null;
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        // LTOR Bypass
         try {
           const laneArrowRaw = lookupLaneArrowValue(laneArrows, v.direction, v.laneIndex);
           const laneArrowNorm = (typeof laneArrowRaw === 'string') ? laneArrowRaw.toLowerCase() : null;
           const isExactLeft = laneArrowNorm === 'left' || laneArrowNorm === 'left-only';
           const isContainsLeft = (!isExactLeft && laneArrowNorm && laneArrowNorm.includes('left'));
           if (ltorActive && (isExactLeft || isContainsLeft) && (v.route === 'left' || v._forceLeft)) {
-            // Bypass TL for left-turn-only lane vehicle
             v._idm.trafficLight.enforced = false;
-            v._idm.trafficLight.reason = 'ltor_bypass';
             v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
             v._idm.tlEnforced = false;
-            v._idm.trafficLight.ltorMatch = isExactLeft ? 'exact' : 'contains';
-            // Clear held TL cap so it won't block motion
             v._idm._heldTlAllowed = undefined;
             continue;
           }
-        } catch (e) {
-          // ignore lookup errors, fallback to TL normal behavior
-        }
-        // ---------- end LTOR ----------
+        } catch (e) {}
 
         if (dist <= STOP_LOOKAHEAD_PX) {
           const stoppingDist = Math.max(0, dist - LASER_SAFE_STOP_PX - SAFETY_BUFFER_PX);
@@ -690,7 +699,7 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
 
           if (light === 'kuning') {
             const withinCommitDistance = dist <= YELLOW_COMMIT_DISTANCE_PX;
-            const timeLeft = getYellowTimeLeftMs(lampu, v.direction); // ms or null
+            const timeLeft = getYellowTimeLeftMs(lampu, v.direction);
             let canReachBeforeEnd = false;
             const currentSpeed = (typeof v.speed === 'number') ? v.speed : ((typeof v._idm.v === 'number') ? v._idm.v : 0);
             const speedForEst = Math.max(currentSpeed, YELLOW_MIN_SPEED_FOR_TIME_CHECK);
@@ -707,21 +716,16 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
               v._idm.trafficLight.enforced = false;
               v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
               v._idm.tlEnforced = false;
-              v._idm.trafficLight.yellowCommit = true;
-              v._idm.trafficLight.reason = withinCommitDistance ? 'yellow_commit_close' : 'yellow_commit_time';
               v._idm._heldTlAllowed = undefined;
             } else {
               v._idm.trafficLight.enforced = true;
-              v._idm.trafficLight.allowed = allowedFromTL;
               v._idm.tlAllowedSpeed = allowedFromTL;
               v._idm.tlEnforced = true;
-              v._idm.trafficLight.reason = 'stop_on_yellow';
               if (typeof v._idm._heldTlAllowed !== 'number') v._idm._heldTlAllowed = allowedFromTL;
               else v._idm._heldTlAllowed = Math.min(v._idm._heldTlAllowed, allowedFromTL);
             }
           } else if (light === 'merah') {
             v._idm.trafficLight.enforced = true;
-            v._idm.trafficLight.allowed = allowedFromTL;
             v._idm.tlAllowedSpeed = allowedFromTL;
             v._idm.tlEnforced = true;
             v._idm.trafficLight.reason = 'red_stop';
@@ -729,18 +733,15 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
             else v._idm._heldTlAllowed = Math.min(v._idm._heldTlAllowed, allowedFromTL);
             if (v._idm.trafficLight.committedOnYellow && !v._idm.trafficLight.passedEntry) {
               v._idm.trafficLight.committedOnYellow = false;
-              v._idm.trafficLight.committedRevokedAt = now;
             }
           } else if (light === 'hijau') {
             v._idm.trafficLight.enforced = false;
             v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
             v._idm.tlEnforced = false;
-            v._idm.trafficLight.reason = 'green';
             v._idm._heldTlAllowed = undefined;
           }
         } else {
           v._idm.trafficLight.enforced = false;
-          v._idm.trafficLight.reason = 'out_of_lookahead';
           v._idm.tlAllowedSpeed = v._idm.provisionalSpeed;
           v._idm.tlEnforced = false;
         }
@@ -761,6 +762,7 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
       v._idm = v._idm || {};
       v._idm.laser = { hit: false, hits: [] };
 
+      // Spawn Grace for Laser
       if (v.createdAt && (now - v.createdAt) < SPAWN_GRACE_MS) {
         v._idm.laser.hit = false;
         v._idm.laserAllowedSpeed = v._idm.provisionalSpeed;
@@ -849,7 +851,7 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
     }
   }
 
-  // 2) overlap prevention
+  // 2) Overlap Prevention
   const all = vehicles.slice();
   for (let i = 0; i < all.length; i++) {
     const v = all[i];
@@ -860,7 +862,6 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
       v._idm.overlapScale = 1.0;
       v._idm.overlapCandidateId = null;
       v._idm.overlapAllowedSpeed = v._idm.provisionalSpeed;
-      v._idm.overlapAllowedSpeedApplied = v._idm.provisionalSpeed;
       continue;
     }
 
@@ -912,7 +913,7 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
     }
   }
 
-  // ----------------- FINAL SPEED APPLY (single place) -----------------
+  // ----------------- FINAL SPEED APPLY -----------------
   for (const v of vehicles) {
     if (!v) continue;
     v._idm = v._idm || {};
@@ -924,34 +925,23 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
 
     let final = provisional;
     final = Math.min(final, tlAllowed, laserAllowed, overlapAllowed);
-
     final = Math.max(0, final);
 
-    // apply held TL cap if present (but if it's extremely small, treat as zero)
     if (typeof v._idm._heldTlAllowed === 'number') {
       const held = v._idm._heldTlAllowed;
-      if (held < MIN_ZERO_HELD_TL) {
-        final = 0;
-      } else {
-        final = Math.min(final, held);
-      }
+      if (held < MIN_ZERO_HELD_TL) final = 0;
+      else final = Math.min(final, held);
     }
 
     const currentSpeed = (typeof v.speed === 'number') ? v.speed : 0;
-
-    // frame-based accel/decel caps (allow both decel and accel per frame)
     const MAX_FRAME_ACCEL_UP = (IDM_PARAMS.a * 4.0) * (deltaTime);
-    const MAX_FRAME_DECEL_UP = (b * 6.0) * (deltaTime); // positive magnitude for decel per frame
-
-    // allow reducing speed rapidly (deceleration) up to MAX_FRAME_DECEL_UP
+    const MAX_FRAME_DECEL_UP = (b * 6.0) * (deltaTime); 
     const maxDown = Math.max(0, currentSpeed - MAX_FRAME_DECEL_UP);
     const maxUp = currentSpeed + Math.max(0, MAX_FRAME_ACCEL_UP);
 
-    // clamp final to [maxDown, maxUp]
     final = Math.min(final, maxUp);
     final = Math.max(final, maxDown);
 
-    // HARD STOP enforcement: if TL demands a red stop and vehicle is very close to entry, force exact zero
     if (v._idm.trafficLight && v._idm.trafficLight.enforced && v._idm.trafficLight.reason === 'red_stop' && typeof v._idm.trafficLight.frontDist === 'number') {
       const hardDist = LASER_SAFE_STOP_PX + SAFETY_BUFFER_PX + HARD_STOP_EXTRA_PX;
       if (v._idm.trafficLight.frontDist <= hardDist) {
@@ -960,12 +950,10 @@ export function updateAntrian(vehicles, laneCoordinates, lampu, deltaTime, stopL
       }
     }
 
-    // also if laser says stop (very close object) force zero
     if (v._idm.laser && v._idm.laser.hit && typeof v._idm.laser.hits?.[0]?.dist === 'number') {
       if (v._idm.laser.hits[0].dist <= LASER_SAFE_STOP_PX + HARD_STOP_EXTRA_PX) final = 0;
     }
 
-    // tiny-floor: remove creeping numerical tiny speeds
     if (final <= STOP_SPEED_FLOOR) final = 0;
 
     v.speed = final;
@@ -982,4 +970,161 @@ export function countStoppedVehicles(vehicles, threshold = 0.001) {
     if (typeof v.speed === 'number' && v.speed < threshold) counts[v.direction]++;
   }
   return counts;
+}
+
+// ----------------- STATISTIK PELAPORAN (REVISI TOTAL) -----------------
+
+/**
+ * Menghitung statistik Real-Time: Flow (Arus) & Queue (Antrian Nyata)
+ * 
+ * LOGIKA ANTRIAN BARU:
+ * 1. Urutkan kendaraan berdasarkan jarak moncong depan ke stop line.
+ * 2. Filter kendaraan yang baru spawn (Umur < SPAWN_IGNORE_QUEUE_MS) --> Efek Radar.
+ * 3. Cari "Kepala Antrian" (First Vehicle):
+ *    - Jarak moncong <= QUEUE_START_LIMIT_PX dari garis.
+ *    - Kecepatan <= QUEUE_SPEED_TOLERANCE (mendukung merayap).
+ * 4. Rangkai kendaraan di belakangnya (Chain):
+ *    - Jarak Gap (Moncong Belakang - Ekor Depan) <= QUEUE_MAX_CHAIN_GAP_PX.
+ *    - Kecepatan <= QUEUE_SPEED_TOLERANCE.
+ * 5. Hitung Panjang: (Jarak Ekor Kendaraan Terakhir dari Garis) - (Jarak Moncong Kendaraan Pertama dari Garis).
+ *    Ini merepresentasikan panjang fisik rangkaian kendaraan.
+ */
+export function getRealTimeTrafficStats(vehicles, entryCoords, laneCoordinates) {
+  const crossingEvents = []; 
+  const queues = {};         
+  const now = nowMs();
+
+  const toKey = (dir, laneIdx) => {
+    const d = dir.charAt(0).toUpperCase() + dir.slice(1).toLowerCase();
+    return `${d}-${laneIdx}`;
+  };
+
+  // Grouping per lajur
+  const vehByLane = {};
+  
+  // Helper: Hitung jarak dari titik P ke Garis StopLine (hanya 1 sumbu)
+  function getDistToLine(x, y, sl, dir) {
+    switch (dir) {
+      case 'utara':   return sl.y - y; // y kendaraan makin kecil saat mendekat (utara di atas, tapi koordinat y=0 di atas?) 
+                                       // Asumsi Canvas: y=0 top, y=height bottom. Utara spawn di top (y kecil) gerak ke +y ?
+                                       // Cek vehmov: spawn utara y=-margin, vy=1. Berarti gerak ke bawah.
+                                       // Stopline di tengah. Jarak = sl.y - v.y (positif jika belum lewat).
+      case 'selatan': return y - sl.y; // Spawn bawah, gerak ke atas (vy=-1). Jarak = v.y - sl.y.
+      case 'timur':   return x - sl.x; // Spawn kanan, gerak ke kiri (vx=-1). Jarak = v.x - sl.x.
+      case 'barat':   return sl.x - x; // Spawn kiri, gerak ke kanan (vx=1). Jarak = sl.x - v.x.
+    }
+    return 0;
+  }
+
+  vehicles.forEach(v => {
+    if (!v.direction || v.laneIndex === undefined) return;
+    const coordKey = `${v.direction.toLowerCase()}_${v.laneIndex}`;
+    const sl = entryCoords[coordKey];
+    if (!sl) return;
+
+    // --- DETEKSI ARUS (CROSSING) ---
+    if (!v.hasCrossed) {
+      let passed = false;
+      const tol = 5; 
+      switch (v.direction) {
+        case 'utara':   if (v.y > sl.y + tol) passed = true; break;
+        case 'selatan': if (v.y < sl.y - tol) passed = true; break;
+        case 'timur':   if (v.x < sl.x - tol) passed = true; break;
+        case 'barat':   if (v.x > sl.x + tol) passed = true; break;
+      }
+
+      if (passed) {
+        v.hasCrossed = true;
+        crossingEvents.push({
+          id: v.id, type: v.type, direction: v.direction, lane: v.laneIndex
+        });
+      }
+    }
+
+    const key = toKey(v.direction, v.laneIndex);
+    if (!vehByLane[key]) vehByLane[key] = { list: [], stopLine: sl, dir: v.direction };
+    vehByLane[key].list.push(v);
+  });
+
+  // --- HITUNG ANTRIAN PER LAJUR ---
+  for (const key in vehByLane) {
+    const group = vehByLane[key];
+    const rawList = group.list;
+    const sl = group.stopLine;
+    const dir = group.dir;
+
+    // 1. Filter: Hanya kendaraan yang BELUM lewat garis DAN SUDAH "matang" (bukan baru spawn)
+    const candidates = rawList.filter(v => {
+      if (v.hasCrossed) return false;
+      // "Radar" Logic: Abaikan kendaraan yang umurnya < SPAWN_IGNORE_QUEUE_MS
+      if (v.createdAt && (now - v.createdAt) < SPAWN_IGNORE_QUEUE_MS) return false;
+      return true;
+    });
+
+    // 2. Sort: Dari yang terdekat ke garis (jarak kecil) ke yang terjauh
+    candidates.sort((a, b) => {
+      const distA = getDistToLine(getVehicleFrontPoint(a).x, getVehicleFrontPoint(a).y, sl, dir);
+      const distB = getDistToLine(getVehicleFrontPoint(b).x, getVehicleFrontPoint(b).y, sl, dir);
+      return distA - distB;
+    });
+
+    // 3. Cari Kepala Antrian (First Stopped Vehicle)
+    let firstIdx = -1;
+    for (let i = 0; i < candidates.length; i++) {
+      const v = candidates[i];
+      const frontDist = getDistToLine(getVehicleFrontPoint(v).x, getVehicleFrontPoint(v).y, sl, dir);
+      const speed = Math.abs(v.speed || 0);
+
+      // Syarat Kepala: Jarak < Limit (misal 20m) DAN Kecepatan < Toleransi (Merayap)
+      if (frontDist <= QUEUE_START_LIMIT_PX && speed <= QUEUE_SPEED_TOLERANCE) {
+        firstIdx = i;
+        break; 
+      }
+    }
+
+    if (firstIdx === -1) {
+      // Tidak ada antrian
+      queues[key] = 0;
+      continue;
+    }
+
+    // 4. Rangkai ke belakang (Chain)
+    let lastIdx = firstIdx;
+    for (let i = firstIdx + 1; i < candidates.length; i++) {
+      const prev = candidates[i - 1];
+      const curr = candidates[i];
+
+      // Jarak fisik: Moncong Curr - (Moncong Prev + Panjang Prev) = Gap
+      const prevFrontDist = getDistToLine(getVehicleFrontPoint(prev).x, getVehicleFrontPoint(prev).y, sl, dir);
+      const currFrontDist = getDistToLine(getVehicleFrontPoint(curr).x, getVehicleFrontPoint(curr).y, sl, dir);
+      
+      const prevLen = vehicleLengthPx(prev);
+      const gap = currFrontDist - (prevFrontDist + prevLen);
+      const speed = Math.abs(curr.speed || 0);
+
+      // Syarat Chain: Gap kecil DAN Speed merayap/berhenti
+      if (gap <= QUEUE_MAX_CHAIN_GAP_PX && speed <= QUEUE_SPEED_TOLERANCE) {
+        lastIdx = i;
+      } else {
+        break; // Rantai putus
+      }
+    }
+
+    // 5. Hitung Panjang Fisik Antrian
+    // Rumus: (Posisi Ekor Terakhir) - (Posisi Moncong Pertama)
+    // Ekor Terakhir = Moncong Terakhir + Panjang Terakhir
+    const vFirst = candidates[firstIdx];
+    const vLast = candidates[lastIdx];
+
+    const distFrontFirst = getDistToLine(getVehicleFrontPoint(vFirst).x, getVehicleFrontPoint(vFirst).y, sl, dir);
+    const distFrontLast = getDistToLine(getVehicleFrontPoint(vLast).x, getVehicleFrontPoint(vLast).y, sl, dir);
+    const lenLast = vehicleLengthPx(vLast);
+
+    const distRearLast = distFrontLast + lenLast;
+    const queuePx = distRearLast - distFrontFirst;
+
+    queues[key] = Math.max(0, queuePx / PX_PER_M);
+  }
+
+  return { crossingEvents, queues };
 }
