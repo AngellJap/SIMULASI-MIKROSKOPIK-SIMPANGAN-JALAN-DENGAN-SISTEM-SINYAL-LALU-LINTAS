@@ -235,10 +235,22 @@
         <canvas id="vehicleCanvas" width="800" height="800"></canvas>
         <button id="resetBtn" class="reset-btn" title="Reset Kendaraan">⟳</button>
         <div class="cycle-container">
-          <canvas id="cycleCanvas" width="300" height="300"></canvas>
+          <canvas id="cycleCanvas" width="520" height="450"></canvas>
         </div>
       </div>
     </div>
+    <div class="config-manager" style="margin-bottom: 15px; padding: 10px; border: 1px dashed #666; border-radius: 5px;">
+    <h4 style="margin-top:0; color: #fff;">Manajemen Skenario</h4>
+    
+    <button id="btnExportJson" style="background-color: #2980b9; color: white; padding: 5px 10px; border: none; cursor: pointer;">
+        💾 Simpan (Download JSON)
+    </button>
+
+    <div style="margin-top: 10px;">
+        <label for="inputImportJson" style="font-size: 12px; color: #ccc;">Muat Skenario:</label>
+        <input type="file" id="inputImportJson" accept=".json" style="color: white;">
+    </div>
+</div>
     <!-- TABEL SUMMARY DITAMBAHKAN DI SINI (TIDAK MENGGANGGU YANG ADA) -->
 <div id="summary-root" style="margin-top:20px;"></div>
 
@@ -303,15 +315,6 @@
         <button class="fase-btn" data-fase="5">5</button>
         <button class="fase-btn" data-fase="6">6</button>
         <button class="fase-btn" data-fase="7">7</button>
-      </div>
-
-      <h3>Merging</h3>
-      <div class="merging-container">
-        <span style="font-weight:bold;">No</span>
-        <label class="switch">
-          <input type="checkbox" id="mergingSwitch"><span class="slider round"></span>
-        </label>
-        <span style="font-weight:bold;">Yes</span>
       </div>
 
       <div class="panel simspeed-panel">
@@ -746,5 +749,20 @@
     </style>
 
   </div> <!-- akhir mainWrapper -->
+  <div id="sim-timer"
+     style="
+        position: absolute;
+        top: 10px; 
+        left: 10px; 
+        color: white; 
+        font-size: 20px; 
+        font-family: Arial, sans-serif;
+        z-index: 10000;">
+    00:00:00
+</div>
+
+<!-- taruh ini di <head> atau sebelum script modul export -->
+<script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+
 </body>
 </html>
