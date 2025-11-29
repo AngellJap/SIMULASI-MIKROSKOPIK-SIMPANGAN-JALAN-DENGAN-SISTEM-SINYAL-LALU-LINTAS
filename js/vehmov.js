@@ -1,13 +1,5 @@
 // vehmov.js (dua-titik axle model: rear & front mengikuti path — truk seperti gerbong)
 // REVISI: Perbaikan sinkronisasi poros depan/belakang agar titik putih tidak "nge-jerk"
-// + Laser depan: simpan koordinat laser di v._laser dan gambar garis hijau di debug
-// Skala asumsi: 10 px == 1 m (PX_PER_M = 10)
-// Perubahan utama:
-// - Tambah helper updateAxlesFromCenter() dan panggil di semua tempat yang memindahkan v.x/v.y
-// - computeDebugBoxForVehicle menyertakan debugBox.front & debugBox.rear
-// - drawDebugPoints sekarang menampilkan titik biru di setiap corner debugBox untuk verifikasi
-// - TAMBAH: perimeterSamples & centerlineSamples disimpan di v.debugBox untuk tiap kendaraan
-// - TAMBAH: Laser depan (v._laser) diupdate setiap frame dan digambar di debug
 import { SpeedLogger } from "./SpeedLogger.js";
 
 export function createVehMovController(options = {}) {
@@ -16,7 +8,7 @@ export function createVehMovController(options = {}) {
   const exitLaneNumbers = options.exitLaneNumbers || {};
   let trafficConfig = options.trafficConfig || {};
   const laneArrows = options.laneArrows || {};
-    // per-lane traffic config (opsional, dikirim dari main.js)
+  // per-lane traffic config (opsional, dikirim dari main.js)
   // Struktur: { utara: [{flow, motorPct, mobilPct, trukPct}, ...], timur: [...], selatan: [...], barat: [...] }
   let laneTrafficConfig = options.laneTrafficConfig || { utara: [], timur: [], selatan: [], barat: [] };
   const canvasSize = options.canvasSize || { width: 800, height: 800 };
@@ -45,7 +37,6 @@ export function createVehMovController(options = {}) {
 
   function setMinSpawnIntervalSec(sec) { _minSpawnIntervalMs = Math.max(0, Math.round(Number(sec) * 1000)); }
   function getMinSpawnIntervalSec() { return _minSpawnIntervalMs / 1000; }
-
 
   // ---------- Laser config (dapat di-override via options) ----------
   const LASER_LENGTH_PX = (typeof options.laserLengthPx === 'number') ? options.laserLengthPx : 30;
@@ -95,17 +86,25 @@ export function createVehMovController(options = {}) {
   function add(a, b) { return { x: a.x + b.x, y: a.y + b.y }; }
   function mul(a, s) { return { x: a.x * s, y: a.y * s }; }
 
+  // ---------- REVISI PENTING: Shifted Exponential Distribution ----------
   function getExponentialInterval(flowPerHour) {
     if (!flowPerHour || flowPerHour <= 0) return Infinity;
+
     const meanSeconds = 3600 / flowPerHour;
+    const meanMs = meanSeconds * 1000;
+
+    if (meanMs <= _minSpawnIntervalMs) {
+      return _minSpawnIntervalMs;
+    }
+
+    const adjustedMeanMs = meanMs - _minSpawnIntervalMs;
     const u = Math.random();
-    const sampledMs = -Math.log(1 - u) * meanSeconds * 1000;
-    // enforce minimum spawn interval
-    return Math.max(sampledMs, _minSpawnIntervalMs);
+    const randomPartMs = -Math.log(1 - u) * adjustedMeanMs;
+
+    return _minSpawnIntervalMs + randomPartMs;
   }
 
   function spawnPositionFor(arah, laneIndexZeroBased) {
-    // gunakan SPAWN_MARGIN agar spawn jauh dari canvas
     const s = skalaPx();
     const offset = (laneIndexZeroBased + 0.5) * s;
     let x = 0, y = 0, vx = 0, vy = 0;
@@ -134,6 +133,104 @@ export function createVehMovController(options = {}) {
         x = canvasSize.width / 2; y = -SPAWN_MARGIN; vx = 0; vy = 1;
     }
     return { x, y, vx, vy };
+  }
+
+  // ---------- SPAWN RADAR: per-lajur (pause berdasarkan jarak antrian) ----------
+  const spawnRadarConfig = Object.assign({
+    radiusPx: 450,        // <--- REVISI: Diperbesar dari 300 ke 450 agar lebih aman mendeteksi antrian
+    spawnIgnoreMs: 1000,  // <--- REVISI: Diperlama sedikit agar kendaraan baru sempat menjauh
+    queueThreshold: 1,    // jika kendaraan (non-new) di dalam radius >= nilai ini -> pause lajur
+    maxPauseMs: 30000,    // fallback: jika pause terlalu lama, otomatis unpause (ms).
+  }, (options.spawnRadar || {}));
+
+  const spawnRadars = { utara: [], timur: [], selatan: [], barat: [] };
+  const spawnPauseState = { utara: [], timur: [], selatan: [], barat: [] };
+
+  function buildSpawnRadars() {
+    for (const dir of ['utara','timur','selatan','barat']) {
+      spawnRadars[dir] = [];
+      spawnPauseState[dir] = [];
+      const laneCount = (config[dir] && config[dir].in) ? config[dir].in : 0;
+      for (let li = 0; li < laneCount; li++) {
+        const sp = spawnPositionFor(dir, li);
+        spawnRadars[dir].push({ x: sp.x, y: sp.y, radius: spawnRadarConfig.radiusPx });
+        spawnPauseState[dir].push({ paused: false, pauseStarted: 0 });
+      }
+    }
+  }
+  try { buildSpawnRadars(); } catch (e) {}
+
+  function updateSpawnRadarsCenters() {
+    for (const dir of ['utara','timur','selatan','barat']) {
+      const lanes = spawnRadars[dir] || [];
+      for (let li = 0; li < lanes.length; li++) {
+        const sp = spawnPositionFor(dir, li);
+        lanes[li].x = sp.x; lanes[li].y = sp.y;
+      }
+    }
+  }
+
+  function countVehiclesInRadar(dir, laneIndexZeroBased) {
+    const radar = (spawnRadars[dir] && spawnRadars[dir][laneIndexZeroBased]) || null;
+    if (!radar) return 0;
+    const r2 = radar.radius * radar.radius;
+    const now = nowMs();
+    let cnt = 0;
+    for (const v of vehicles) {
+      if (v.direction !== dir) continue;
+      if ((v.laneIndex - 1) !== laneIndexZeroBased) continue;
+      // ignore kendaraan baru lahir
+      if (typeof v.createdAt === 'number' && (now - v.createdAt) <= spawnRadarConfig.spawnIgnoreMs) continue;
+      
+      const dx = v.x - radar.x, dy = v.y - radar.y;
+      if ((dx*dx + dy*dy) <= r2) cnt++;
+    }
+    return cnt;
+  }
+
+  // UTAMA: update tiap frame — jika cnt >= queueThreshold -> paused true.
+  function updateSpawnRadars(now = null) {
+    const tnow = now === null ? nowMs() : now;
+    for (const dir of ['utara','timur','selatan','barat']) {
+      const lanes = spawnRadars[dir] || [];
+      for (let li = 0; li < lanes.length; li++) {
+        let state = spawnPauseState[dir][li] || { paused: false, pauseStarted: 0 };
+        const cnt = countVehiclesInRadar(dir, li);
+        
+        // trigger pause jika belum paused dan cnt >= threshold
+        if (!state.paused && cnt >= spawnRadarConfig.queueThreshold) {
+          state.paused = true;
+          state.pauseStarted = tnow;
+        }
+        // jika sudah paused, cek kondisi resume: cnt < threshold -> unpause
+        if (state.paused) {
+          if (cnt < spawnRadarConfig.queueThreshold) {
+            state.paused = false;
+            state.pauseStarted = 0;
+          } else if (spawnRadarConfig.maxPauseMs && (tnow - (state.pauseStarted || 0)) > spawnRadarConfig.maxPauseMs) {
+            // fallback safety
+            state.paused = false;
+            state.pauseStarted = 0;
+          }
+        }
+        spawnPauseState[dir][li] = state;
+      }
+    }
+  }
+
+  function isLanePaused(dir, laneIndexZeroBased) {
+    const s = (spawnPauseState[dir] && spawnPauseState[dir][laneIndexZeroBased]);
+    return !!(s && s.paused);
+  }
+
+  function setSpawnRadarOptions(opts = {}) {
+    Object.assign(spawnRadarConfig, opts);
+    if (typeof opts.radiusPx === 'number') {
+      for (const dir of ['utara','timur','selatan','barat']) {
+        const lanes = spawnRadars[dir] || [];
+        for (const r of lanes) r.radius = spawnRadarConfig.radiusPx;
+      }
+    }
   }
 
   // ---------- geometry helpers ----------
@@ -452,53 +549,71 @@ export function createVehMovController(options = {}) {
 
     const route = v.route || 'straight';
     let exitDir = null;
-    if (route === 'straight') exitDir = exitDirectionFor(v.direction, 'straight');
-    else exitDir = exitDirectionFor(v.direction, route);
+
+    if (route === 'straight') 
+        exitDir = exitDirectionFor(v.direction, 'straight');
+    else 
+        exitDir = exitDirectionFor(v.direction, route);
+    
     if (!exitDir) return;
 
     let exitPoint = laneCoordinates.exit[`${exitDir}_${v.laneIndex}`] || null;
-    if (!exitPoint) exitPoint = findExitPoint(exitDir, v.exitLane, v.laneIndex);
+    if (!exitPoint) 
+        exitPoint = findExitPoint(exitDir, v.exitLane, v.laneIndex);
+
     if (!exitPoint) {
-      const allExitKeys = Object.keys(laneCoordinates.exit || {});
-      for (const k of allExitKeys) {
-        const d = dirFromKey(k);
-        if (d && d !== v.direction) { exitPoint = laneCoordinates.exit[k]; exitDir = d; break; }
-      }
+        const allExitKeys = Object.keys(laneCoordinates.exit || {});
+        for (const k of allExitKeys) {
+            const d = dirFromKey(k);
+            if (d && d !== v.direction) { 
+                exitPoint = laneCoordinates.exit[k]; 
+                exitDir = d; 
+                break; 
+            }
+        }
     }
+
     if (!exitPoint) return;
 
+    // ⭐⭐⭐ PATCH WAJIB — letakkan di sini ⭐⭐⭐
+    // Simpan arah keluar yang benar (Utara/Timur/Selatan/Barat)
+    v.exitDir = exitDir;
+    // ⭐⭐⭐ END PATCH ⭐⭐⭐
+
+    // --- lanjutan kode asli Anda ---
     let maneuverSeg = null;
     if (route === 'straight') {
-      const cps = computeCubicForStraight(entry, exitPoint);
-      if (cps && cps.length === 2) {
-        maneuverSeg = { type: 'cubic', p0: entry, p1: cps[0], p2: cps[1], p3: exitPoint };
-      } else {
-        maneuverSeg = { type: 'line', p0: entry, p1: exitPoint };
-      }
+        const cps = computeCubicForStraight(entry, exitPoint);
+        if (cps && cps.length === 2) {
+            maneuverSeg = { type: 'cubic', p0: entry, p1: cps[0], p2: cps[1], p3: exitPoint };
+        } else {
+            maneuverSeg = { type: 'line', p0: entry, p1: exitPoint };
+        }
     } else {
-      const cp = computeQuadraticControlPoint(entry, exitPoint, v.direction, exitDir);
-      if (cp) maneuverSeg = { type: 'quadratic', p0: entry, p1: cp, p2: exitPoint };
-      else maneuverSeg = { type: 'line', p0: entry, p1: exitPoint };
+        const cp = computeQuadraticControlPoint(entry, exitPoint, v.direction, exitDir);
+        if (cp) 
+            maneuverSeg = { type: 'quadratic', p0: entry, p1: cp, p2: exitPoint };
+        else 
+            maneuverSeg = { type: 'line', p0: entry, p1: exitPoint };
     }
 
-    // compute exit tangent (t = 1) and off-canvas point colinear with that tangent
     let exitTan = null;
     if (maneuverSeg.type === 'cubic') {
-      exitTan = cubicTangent(1, maneuverSeg.p0, maneuverSeg.p1, maneuverSeg.p2, maneuverSeg.p3);
+        exitTan = cubicTangent(1, maneuverSeg.p0, maneuverSeg.p1, maneuverSeg.p2, maneuverSeg.p3);
     } else if (maneuverSeg.type === 'quadratic') {
-      exitTan = bezierTangent(1, maneuverSeg.p0, maneuverSeg.p1, maneuverSeg.p2);
+        exitTan = bezierTangent(1, maneuverSeg.p0, maneuverSeg.p1, maneuverSeg.p2);
     } else {
-      exitTan = lineTangent(maneuverSeg.p0, maneuverSeg.p1);
+        exitTan = lineTangent(maneuverSeg.p0, maneuverSeg.p1);
     }
     if (!exitTan) exitTan = { x: 0, y: -1 };
+
     const off = offCanvasPointForDirAlongTangent(exitPoint, exitTan);
 
-    // ensure rear exists
     if (typeof v.rearX !== 'number' || typeof v.rearY !== 'number') {
-      const centerOffset = v.wheelbase * 0.5;
-      const heading = (v.angle ?? 0) + Math.PI/2 - ANGLE_ADJUST;
-      v.rearX = v.x - centerOffset * Math.cos(heading);
-      v.rearY = v.y - centerOffset * Math.sin(heading);
+        const centerOffset = v.wheelbase * 0.5;
+        const heading = (v.angle ?? 0) + Math.PI/2 - ANGLE_ADJUST;
+        v.rearX = v.x - centerOffset * Math.cos(heading);
+        v.rearY = v.y - centerOffset * Math.sin(heading);
     }
 
     const segs = [];
@@ -517,7 +632,7 @@ export function createVehMovController(options = {}) {
     v.approachingTurn = true;
     v.turnLength = built.totalLength || 0;
     v.turnTraveled = 0;
-  }
+}
 
   // ---------- helper: sync front/rear (poros) dari center + heading ----------
   // heading = angle in radians (vector heading) i.e. atan2(sin, cos)
@@ -567,6 +682,13 @@ export function createVehMovController(options = {}) {
       laneIndex: laneIndexZeroBased + 1,
       type, exitLane: exitLane || null,
       speed: baseSpeed,
+      // ---- PATCH: save free-flow speed (km/jam) ----
+freeFlowKmh: (() => {
+    const pxPerSecond = baseSpeed * 1000;
+    const mPerSecond = pxPerSecond / PX_PER_M;
+    return mPerSecond * 3.6;
+})(),
+// ----------------------------------------------
       createdAt: nowMs(),
       turning: false, approachingTurn: false, route: "straight",
       turnProgress: 0, turnEntry: null, turnExit: null, controlPoint: null,
@@ -681,6 +803,9 @@ function generateVehicleID(type, direction) {
   return `${prefix}${num}${dirLetter}`;
 }
 
+// =========================
+// SPAWN RANDOM VEHICLE (REVISED WITH RADAR CHECK)
+// =========================
 function spawnRandomVehicle(forcedDirection = null) {
   const directions = ['utara', 'timur', 'selatan', 'barat'];
   const arah = forcedDirection || directions[Math.floor(Math.random() * directions.length)];
@@ -710,6 +835,11 @@ function spawnRandomVehicle(forcedDirection = null) {
     }
   } catch (e) {
     chosenLaneCfg = null;
+  }
+
+  // ***** RADAR CHECK: Jika lajur yang dipilih PAUSED, batalkan spawn *****
+  if (isLanePaused(arah, laneIndex)) {
+    return null;
   }
 
   // Pilih tipe kendaraan berdasarkan bobot per-lajur (jika ada), else fallback lama
@@ -1031,6 +1161,46 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
   // ---------- MAIN UPDATE ----------
   function update(deltaMs) {
     if (!deltaMs || deltaMs <= 0) return;
+    const now = nowMs();
+
+    // 1. Update Radar State (Check Antrian per Lajur)
+    try { updateSpawnRadars(now); } catch (e) {}
+
+    // ============================================================
+    // FITUR BARU: "SPAWN COLLISION CLEANUP"
+    // Hapus kendaraan yang baru lahir jika terdeteksi overlap parah
+    // ============================================================
+    for (let i = vehicles.length - 1; i >= 0; i--) {
+      const v = vehicles[i];
+      
+      // Hanya cek kendaraan yang umurnya < 1 detik (baru lahir)
+      if (v.createdAt && (now - v.createdAt) < 1000) {
+        
+        // Cek indikator tabrakan dari antrian.js
+        // overlapScale kecil (< 0.2) atau ada candidateId tabrakan
+        const isCrashing = v._idm && (v._idm.overlapScale < 0.2 || v._idm.overlapCandidateId !== null);
+        
+        // Cek apakah dia macet total (speed 0) padahal harusnya jalan
+        const isStuck = (v.speed <= 0.0001);
+
+        if (isCrashing && isStuck) {
+          console.warn(`[AUTO-FIX] Menghapus kendaraan ${v.id} yang spawn tabrakan.`);
+          
+          // Hapus kendaraan dari array
+          vehicles.splice(i, 1);
+          
+          // JADWALKAN ULANG (RETRY)
+          // Mundurkan jadwal spawn arah ini 1 detik dari sekarang
+          if (nextSpawnTimes && v.direction) {
+             nextSpawnTimes[v.direction] = now + 1000; 
+          }
+          
+          // Lanjut loop, jangan proses fisika untuk kendaraan yang sudah dihapus ini
+          continue; 
+        }
+      }
+    }
+    // ============================================================
 
     // First: decide desired speed for each vehicle based on vehicle ahead (no collision push)
     for (const v of vehicles) {
@@ -1078,6 +1248,14 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
         desiredSpeed = (typeof v.desiredSpeed === 'number') ? v.desiredSpeed : baseSpeed;
       }
 
+      // ==================================================================
+      // FIX CREEPING/MENEROBOS LAMPU MERAH
+      // Paksa vehmov menghormati limit kecepatan dari antrian.js (lampu merah/laser)
+      if (v._idm && typeof v._idm.finalAppliedSpeed === 'number') {
+          desiredSpeed = Math.min(desiredSpeed, v._idm.finalAppliedSpeed);
+      }
+      // ==================================================================
+
       // store desiredSpeed to use in motion update
       v._desiredSpeed = desiredSpeed;
       v._accelRate = accel;
@@ -1105,6 +1283,12 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
 
       // then apply movement same as before but using v.speed as travel rate
       let moveBudget = v.speed * deltaMs;
+
+      // FIX DRIFT: Jika target 0 dan speed sudah 0, jangan ada budget gerak sama sekali
+      if (desired <= EPS && v.speed <= EPS) {
+          v.speed = 0;
+          moveBudget = 0;
+      }
 
       while (moveBudget > EPS) {
         // approachingTurn: find closest on path -> create blend or snap
@@ -1595,7 +1779,12 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
       console.warn("setLaneTrafficConfig failed:", e);
     }
   }
-  function setCanvasSize(sz) { if (sz?.width && sz?.height) { canvasSize.width = sz.width; canvasSize.height = sz.height; } }
+
+  function setCanvasSize(sz) { 
+    if (sz?.width && sz?.height) { canvasSize.width = sz.width; canvasSize.height = sz.height; } 
+    // update radar positions if canvas size changes
+    try { updateSpawnRadarsCenters(); } catch(e) {}
+  }
 
   function setLaneCoordinates(newLc) {
     if (!newLc) return;
@@ -1604,6 +1793,8 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
     for (const v of vehicles) {
       try { assignExitAndControlForVehicle(v); } catch (e) { console.warn("setLaneCoordinates: reassign failed untuk veh#", v.id, e); }
     }
+    // update radar because lane config might have changed
+    try { buildSpawnRadars(); updateSpawnRadarsCenters(); } catch (e) {}
   }
   function clearAllVehicles() {
     vehicles.length = 0;
@@ -1617,6 +1808,7 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
     drawDebugPoints, drawDebugPaths, drawDebugBoxes, setLaneTrafficConfig,
     setLaneCoordinates,
     // min spawn interval control (seconds)
-    setMinSpawnIntervalSec, getMinSpawnIntervalSec
+    setMinSpawnIntervalSec, getMinSpawnIntervalSec,
+     setSpawnRadarOptions // EXPORTED: agar bisa tuning radar dari luar
   };
 }
