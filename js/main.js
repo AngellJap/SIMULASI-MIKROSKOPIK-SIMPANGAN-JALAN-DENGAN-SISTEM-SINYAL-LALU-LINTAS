@@ -17,14 +17,85 @@ import { LampuLaluLintas } from './LampuLaluLintas.js';
 import { getLaneButtonPositions } from './InfrastrukturJalan/drawArrow.js';
 import { drawLaneCenters, drawVehicle } from "./vehicle.js";
 import { createVehMovController } from './vehmov.js'; // <-- controller baru
-import { updateAntrian } from './antrian.js';
+import { updateAntrian, getRealTimeTrafficStats } from './antrian.js';
 import createSiklusLampu from './SiklusLampu.js';
 import { initSummary, updateSummaryTable } from './Summary.js';
 import { SpeedLogger } from "./SpeedLogger.js";
+import initPhaseModel from './phaseModel.js';
+import { downloadKonfigurasi, uploadKonfigurasi } from './ConfigManager.js';
+import { initReportExporter } from './ReportExporter.js';
 
 document.addEventListener('DOMContentLoaded', init);
 
+// 1. Listener Tombol Download
+    const btnDownload = document.getElementById('btnExportJson');
+    if (btnDownload) {
+        btnDownload.addEventListener('click', downloadKonfigurasi);
+    }
+
+    // 2. Listener Input Upload
+    const inputUpload = document.getElementById('inputImportJson');
+    if (inputUpload) {
+        inputUpload.addEventListener('change', uploadKonfigurasi);
+    }
+// === LTOR GLOBAL SWITCH ===
+document.getElementById("ltsorGlobalSwitch")
+   .addEventListener("change", (e) => {
+        const val = e.target.checked;   // true = LTOR, false = NLTOR
+
+         // beritahu SiklusLampu.js
+        if (siklus && typeof siklus.setLTOR === 'function') {
+            siklus.setLTOR(val);
+        }
+
+        // beritahu LampuLaluLintas utama (jika ada)
+        if (window.lampu) {
+            lampu.ltor = val;
+        }
+
+        // redraw diagram
+        siklusLampu.draw();
+   });
+
+// ===== LISTENER UNTUK PHASE MODEL =====
+document.addEventListener("laneArrowsUpdated", (ev) => {
+  const updated = ev.detail.laneArrows;
+  console.log("PhaseModel → laneArrows updated:", updated);
+
+  // paksa main.js refresh config untuk spawn lane
+  if (typeof rebuildSpawnLanes === "function") {
+    rebuildSpawnLanes(updated);     // ★ penting: panggil ulang builder spawn
+  }
+
+  // update tampilan UI select (in/out tetap locked)
+  updateLaneArrowIndicators(updated);
+});
+
+// optional: saat model berubah
+document.addEventListener("phaseModelChanged", (ev) => {
+  console.log("PhaseModel aktif:", ev.detail);
+});
+
+// perbarui arrow indikator pada UI (kalau kamu punya panelnya)
+function updateLaneArrowIndicators(laneArrows) {
+  ["utara","timur","selatan","barat"].forEach(dir => {
+    const a1 = document.getElementById(dir + "-lane1-arrow");
+    const a2 = document.getElementById(dir + "-lane2-arrow");
+    if (a1) a1.textContent = laneArrows[dir][0];
+    if (a2) a2.textContent = laneArrows[dir][1];
+  });
+}
+
+// dipanggil jika arrow berubah, supaya spawning mengikuti fase
+function rebuildSpawnLanes(arrows) {
+  console.log("Rebuild spawn lane using arrows:", arrows);
+  window.laneArrows = arrows;   // overwrite
+  // kalau kamu punya fungsi lain, panggil disini:
+  if (typeof rebuildLaneInputs === "function") rebuildLaneInputs();
+}
+
 // Global references agar bisa diakses fungsi resetSimulation
+// SIMULASI TIMER (global)
 let lampu = null;
 let vehController = null;
 let siklus = null;
@@ -32,6 +103,34 @@ let lastTimestamp = 0;
 let running = false;
 let simSpeed = 1;
 let phaseMode = "searah"; // default
+// --- VARIABEL GLOBAL TAMBAHAN ---
+let realTrafficStats = {
+  startTime: null,
+  counts: {}
+};
+
+// ===== SIMULATION TIMER =====
+let simTimerStart = null;
+let simTimerElapsedMs = 0;
+
+// Format HH:MM:SS
+function formatSimTime(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    return (
+        String(h).padStart(2, '0') + ":" +
+        String(m).padStart(2, '0') + ":" +
+        String(s).padStart(2, '0')
+    );
+}
+
+function resetRealStats() {
+  realTrafficStats.startTime = Date.now();
+  realTrafficStats.counts = {};
+}
+// --------------------------------
 
 window.exportSpeedData = () => {
     const out = SpeedLogger.getFinished();
@@ -58,21 +157,18 @@ let laneTrafficConfig = {
 };
 // ---------------------------------------------------------------------
 
+// Ganti fungsi generateSpeedTables yang error dengan ini:
 function generateSpeedTables() {
-    const speedContainer = document.getElementById("speed-table-container");
-    if (!speedContainer) return;
-
-    // Ambil data kendaraan yang sudah keluar dari canvas
-    const tables = SpeedLogger.getFinished();
-
-    // Bangun tabel kecepatan
-    buildSpeedTables(speedContainer, finished, {
-        pxPerMeter: 10,      // ganti sesuai sistem kamu
-        sampleCount: 10
-    });
-
-    // Tambahkan tombol CSV & XLS otomatis
-    autoAttachExportButtons(speedContainer);
+  try {
+    // Gunakan fungsi dari SpeedLogger yang sudah di-import
+    if (SpeedLogger && typeof SpeedLogger.renderInto === 'function') {
+      SpeedLogger.renderInto("speed-table-container");
+    } else {
+      console.warn("SpeedLogger not ready");
+    }
+  } catch (e) {
+    console.warn("generateSpeedTables failed:", e);
+  }
 }
 
 function init() {
@@ -162,6 +258,7 @@ window.addEventListener("resetCycleCanvas", (e) => {
         selatan: { flow: 500, truckPct: 20 },
         barat: { flow: 500, truckPct: 20 },
     };
+
 // === TAMBAHAN MODEL 3 FASE ===
 // Inisialisasi default mode fase searah
 try {
@@ -218,6 +315,20 @@ function setActivePhaseButton(mode) {
   }
 });
 // === TAMBAHAN MODEL 3 FASE SELESAI ===
+
+// === INISIALISASI MODEL FASE 1-7 ===
+try {
+    initPhaseModel({
+        config,
+        laneArrows,
+        lampu,
+        siklus,
+        updateConfig,
+        drawLayout
+    });
+} catch(e) {
+    console.warn("initPhaseModel gagal:", e);
+}
 
     const MAX_FLOW_PER_LANE = 600;
     function getMaxFlow(arah) { return (config[arah] && config[arah].in) * MAX_FLOW_PER_LANE; }
@@ -741,6 +852,11 @@ if (ltorEl) {
         rebuildLaneTrafficConfig();
         readLaneTrafficInputs();
 
+        // [MODIFIKASI] Beritahu siklus diagram tentang panah baru (dari reset default)
+        if (siklus && typeof siklus.setLaneArrows === 'function') {
+            siklus.setLaneArrows(laneArrows);
+        }
+
         drawLayout();
 
         // inform vehController about updated lane coordinates & traffic
@@ -774,6 +890,12 @@ if (ltorEl) {
                                 const currentIndex = arrowTypes.indexOf(currentType);
                                 const nextIndex = (currentIndex + 1) % arrowTypes.length;
                                 laneArrows[arah][i] = arrowTypes[nextIndex];
+                                
+                                // [MODIFIKASI] Kirim data panah terbaru ke SiklusLampu
+                                if (siklus && typeof siklus.setLaneArrows === 'function') {
+                                    siklus.setLaneArrows(laneArrows);
+                                }
+                                
                                 drawLayout();
                                 if (typeof vehController?.setLaneCoordinates === 'function') vehController.setLaneCoordinates(laneCoordinates);
                             }
@@ -1105,6 +1227,29 @@ if (typeof vehController?.setLaneTrafficConfig === 'function') {
     function animate(timestamp) {
         const deltaTime = timestamp - lastTimestamp;
         lastTimestamp = timestamp;
+        // ================= TIMER UPDATE (HH:MM:SS) =================
+if (typeof simTimerStart === 'undefined') {
+    // variabel global auto-dibuat
+    window.simTimerStart = null;
+    window.simTimerElapsedMs = 0;
+}
+
+if (simTimerStart === null) {
+    simTimerStart = timestamp;   // mulai timer pertama kali
+}
+
+simTimerElapsedMs = timestamp - simTimerStart;
+
+// update ke UI
+const timerDiv = document.getElementById("sim-timer");
+if (timerDiv) timerDiv.textContent = formatSimTime(simTimerElapsedMs);
+// =============================================================
+
+        let vehiclesBefore = [];
+        if (typeof vehController !== 'undefined' && vehController) {
+             vehiclesBefore = vehController.getVehicles();
+        }
+        
         // tick lampu dulu sehingga siklus membaca state yang paling up-to-date
         try { lampu.tick(deltaTime); } catch (e) { }
         if (siklus) {
@@ -1127,8 +1272,6 @@ if (typeof vehController?.setLaneTrafficConfig === 'function') {
 
         // 2) run car-following / antrian logic
         try {
-            const vehiclesBefore = vehController.getVehicles();
-            
             // INI PENTING: 'config' yang berisi status switch diteruskan ke antrian.js
             updateAntrian(vehiclesBefore, laneCoordinates, lampu, deltaTime, config, laneArrows);
 
@@ -1136,107 +1279,196 @@ if (typeof vehController?.setLaneTrafficConfig === 'function') {
             console.warn("updateAntrian failed:", e);
         }
 
-        // 3) update vehicle positions
+    // 1. Inisialisasi Waktu
+if (!realTrafficStats.startTime) realTrafficStats.startTime = Date.now();
+        const nowMs = Date.now();
+        const elapsedSec = (nowMs - realTrafficStats.startTime) / 1000;
+        
+        // Data sementara untuk frame ini yang akan dikirim ke Summary
+        let currentFlowData = {}; 
+
         try {
-            vehController.update(deltaTime);
-        } catch (e) {
-            console.warn("vehController.update failed:", e);
-        }
-
-        // 4) draw vehicles
-        const vehiclesFromCtrl = vehController.getVehicles();
-        vehiclesFromCtrl.forEach(vehicle => {
-            vctx.save();
-            vctx.translate(vehicle.x, vehicle.y);
-            if (typeof vehicle.angle === "number") {
-                vctx.rotate(vehicle.angle);
-            } else {
-                if (vehicle.direction === 'timur') vctx.rotate(-Math.PI / 2);
-                else if (vehicle.direction === 'barat') vctx.rotate(Math.PI / 2);
-                else if (vehicle.direction === 'utara') vctx.rotate(Math.PI);
-            }
-            drawVehicle(vctx, { x: 0, y: 0, type: vehicle.type });
-            if (vehicle.id) {
-                vctx.fillStyle = "yellow";
-                vctx.font = "bold 12px Arial";
-                vctx.textAlign = "center";
-                vctx.textBaseline = "bottom";
-                let offset = 6;
-                if (vehicle.type === "truk") offset = 10;
-                else if (vehicle.type === "mobil") offset = 8;
-                vctx.fillText(vehicle.id, 0, -vehicle.lengthPx / 2 - 6);
-            }
-            vctx.restore();
-        });
-
-        // 5) DRAW DEBUG visuals
-        if (typeof vehController.drawDebugPaths === 'function') {
-            try { vehController.drawDebugPaths(vctx); } catch (e) { console.warn("drawDebugPaths failed:", e); }
-        }
-        if (typeof vehController.drawDebugPoints === 'function') {
-            try { vehController.drawDebugPoints(vctx); } catch (e) { console.warn("drawDebugPoints failed:", e); }
-        }
-        if (typeof vehController.drawDebugBoxes === 'function') {
-            try { vehController.drawDebugBoxes(vctx); } catch (e) { console.warn("drawDebugBoxes failed:", e); }
-        }
-
-        requestAnimationFrame(animate);
-    }
-
+            // 1. AMBIL DATA KENDARAAN TERBARU
+            let activeVehicles = [];
+                        if (vehController && typeof vehController.getVehicles === 'function') {
+                             activeVehicles = vehController.getVehicles();
+                        }
+            
+                        // 2. Ambil referensi Stop Line (titik acuan)
+                        // laneCoordinates.entry berisi { "utara_1": {x,y}, "timur_2": {x,y}, ... }
+                        const entryCoords = (laneCoordinates && laneCoordinates.entry) ? laneCoordinates.entry : {};
+                        
+                        // 3. Panggil fungsi hitung di antrian.js
+                        const rtStats = getRealTimeTrafficStats(activeVehicles, entryCoords, laneCoordinates); 
+            
+                        // 4. Akumulasi Hitungan Kendaraan Lewat (SMP)
+                        if (rtStats && rtStats.crossingEvents) {
+                            rtStats.crossingEvents.forEach(evt => {
+                                // Normalisasi Key: "Utara-1"
+                                const dirStr = evt.direction.charAt(0).toUpperCase() + evt.direction.slice(1);
+                                const key = `${dirStr}-${evt.lane}`; 
+                                
+                                // Faktor SMP (Motor=0.2, Truk=1.3, Mobil=1.0)
+                                let factor = 1.0;
+                                const type = (evt.type || "").toLowerCase();
+                                if (type.includes("motor")) factor = 0.2; // acuan MKJI
+                                else if (type.includes("truk")) factor = 1.3;
+            
+                                if (!realTrafficStats.counts[key]) realTrafficStats.counts[key] = 0;
+                                realTrafficStats.counts[key] += factor;
+                            });
+                        }
+            
+                        // 5. Hitung Flow Rate (smp/jam) & Ambil Queue (meter)
+                        const elapsedHours = elapsedSec / 3600;
+                        
+                        ["Utara", "Timur", "Selatan", "Barat"].forEach(dirLabel => {
+                            const dirKey = dirLabel.toLowerCase(); 
+                            // Cek jumlah lajur aktif
+                            const numLanes = (config[dirKey] && config[dirKey].in) ? config[dirKey].in : 1;
+            
+                            for (let i = 1; i <= numLanes; i++) {
+                                const key = `${dirLabel}-${i}`;
+                                
+                                // a. Flow Rate: Total SMP / Jam Berjalan
+                                const totalSmp = realTrafficStats.counts[key] || 0;
+                                // Hindari spike di detik-detik awal (min 2 detik)
+                                const flowPerHour = elapsedSec > 2 ? (totalSmp / elapsedHours) : 0;
+                                
+                                // b. Queue: Ambil snapshot langsung dari antrian.js
+                                const queueM = (rtStats && rtStats.queues) ? (rtStats.queues[key] || 0) : 0;
+                                
+                                currentFlowData[key] = { 
+                                    flow: flowPerHour, 
+                                    queue: queueM 
+                                };
+                            }
+                        });
+            
+                        // 6. Kirim ke Summary Table
+                        if (typeof updateSummaryTable === 'function') {
+                            updateSummaryTable(config, currentFlowData);
+                        }
+            
+                    } catch (errCalc) {
+                        console.warn("Error calculating real stats:", errCalc);
+                    }
+            
+                    // ====================================================
+                    // [D] LANJUT KE UPDATE POSISI KENDARAAN
+                    // ====================================================
+            
+                    // 3) update vehicle positions
+                    try {
+                        vehController.update(deltaTime);
+                    } catch (e) {
+                        console.warn("vehController.update failed:", e);
+                    }
+            
+                    // 4) draw vehicles
+                    const vehiclesFromCtrl = vehController.getVehicles();
+                    vehiclesFromCtrl.forEach(vehicle => {
+                        vctx.save();
+                        vctx.translate(vehicle.x, vehicle.y);
+                        if (typeof vehicle.angle === "number") {
+                            vctx.rotate(vehicle.angle);
+                        } else {
+                            if (vehicle.direction === 'timur') vctx.rotate(-Math.PI / 2);
+                            else if (vehicle.direction === 'barat') vctx.rotate(Math.PI / 2);
+                            else if (vehicle.direction === 'utara') vctx.rotate(Math.PI);
+                        }
+                        drawVehicle(vctx, { x: 0, y: 0, type: vehicle.type });
+                        if (vehicle.id) {
+                            vctx.fillStyle = "yellow";
+                            vctx.font = "bold 12px Arial";
+                            vctx.textAlign = "center";
+                            vctx.textBaseline = "bottom";
+                            let offset = 6;
+                            if (vehicle.type === "truk") offset = 10;
+                            else if (vehicle.type === "mobil") offset = 8;
+                            vctx.fillText(vehicle.id, 0, -vehicle.lengthPx / 2 - 6);
+                        }
+                        vctx.restore();
+                    });
+            
+                    // 5) DRAW DEBUG visuals
+                    if (typeof vehController.drawDebugPaths === 'function') {
+                        try { vehController.drawDebugPaths(vctx); } catch (e) { console.warn("drawDebugPaths failed:", e); }
+                    }
+                    if (typeof vehController.drawDebugPoints === 'function') {
+                        try { vehController.drawDebugPoints(vctx); } catch (e) { console.warn("drawDebugPoints failed:", e); }
+                    }
+                    if (typeof vehController.drawDebugBoxes === 'function') {
+                        try { vehController.drawDebugBoxes(vctx); } catch (e) { console.warn("drawDebugBoxes failed:", e); }
+                    }
+            
+                    requestAnimationFrame(animate);
+                }
+            
 Promise.all(loadImagePromises).then(() => {
     try {
         updateConfig();
 
-        // <-- PASANG INI: inisialisasi modul Summary (tambah setelah updateConfig)
-        try {
-          // inisialisasi ke elemen #summary-root
-          initSummary('summary-root');
-          // lakukan update awal (optional: pass config jika ingin)
-          updateSummaryTable(config);
-        } catch (e) {
-          console.warn("Summary init/update failed:", e);
-        }
+        // Summary UI wajib dibuat dulu sebelum Exporter
+        initSummary('summary-root');
+        updateSummaryTable(config);
 
-        try { lampu.updatePosition(config); } catch (e) { }
+        // Setelah summary sudah ada → baru buat tombol export
+        initReportExporter({
+            containerId: "summary-root",
+            buttonId: "download-excel-btn"
+        });
+
+        lampu.updatePosition(config);
+
+        // Jangan lupa jalankan animasi simulasi setelah semua UI siap
         requestAnimationFrame(animate);
+
     } catch (e) {
         console.error("Initialization error:", e);
     }
 });
-} // end init
+            } // end init
+            
+            function resetSimulation() {
+// ===== RESET TIMER =====
+simTimerStart = null;
+simTimerElapsedMs = 0;
+const timerDiv = document.getElementById("sim-timer");
+if (timerDiv) timerDiv.textContent = "00:00:00";
 
-function resetSimulation() {
-  console.log("🔄 Reset simulation triggered");
-
-  // 1️⃣ Reset kendaraan
-  if (vehController && typeof vehController.clearAllVehicles === "function") {
-    vehController.clearAllVehicles();
-    console.log("🚗 Semua kendaraan dihapus dari simulasi");
-  }
-
-  // 2️⃣ Reset lampu lalu lintas ke all-red
-  if (lampu && typeof lampu.resetAll === "function") {
-    lampu.resetAll();
-    lampu.draw();
-    console.log("🚦 Lampu lalu lintas direset ke all-red");
-  }
-
-  // 3️⃣ Reset diagram siklus (cycleCanvas)
-  if (siklus && typeof siklus.resetCycleDiagram === "function") {
-    siklus.resetCycleDiagram();
-    console.log("🔁 Diagram siklus di-reset ke fase awal");
-  }
-
-  // 4️⃣ Setelah 2 detik → aktifkan arah Utara (hijau)
-  setTimeout(() => {
-    if (lampu && typeof lampu.setCurrentDirection === "function") {
-      lampu.setCurrentDirection("utara");
-      lampu.draw();
-      console.log("🟢 Lampu utara menyala kembali (fase pertama)");
-    }
-  }, 2000);
-
-  console.log("✅ Reset selesai: kendaraan, lampu, dan diagram diulang dari awal.");
-}
-
-setInterval(generateSpeedTables, 1000);
+            resetRealStats();
+              console.log("🔄 Reset simulation triggered");
+            
+              // 1️⃣ Reset kendaraan
+              if (vehController && typeof vehController.clearAllVehicles === "function") {
+                vehController.clearAllVehicles();
+                console.log("🚗 Semua kendaraan dihapus dari simulasi");
+              }
+            
+              // 2️⃣ Reset lampu lalu lintas ke all-red
+              if (lampu && typeof lampu.resetAll === "function") {
+                lampu.resetAll();
+                lampu.draw();
+                console.log("🚦 Lampu lalu lintas direset ke all-red");
+              }
+            
+              // 3️⃣ Reset diagram siklus (cycleCanvas)
+              if (siklus && typeof siklus.resetCycleDiagram === "function") {
+                siklus.resetCycleDiagram();
+                console.log("🔁 Diagram siklus di-reset ke fase awal");
+              }
+            
+              // 4️⃣ Setelah 2 detik → aktifkan arah Utara (hijau)
+              setTimeout(() => {
+                if (lampu && typeof lampu.setCurrentDirection === "function") {
+                  lampu.setCurrentDirection("utara");
+                  lampu.draw();
+                  console.log("🟢 Lampu utara menyala kembali (fase pertama)");
+                }
+              }, 2000);
+            
+              console.log("✅ Reset selesai: kendaraan, lampu, dan diagram diulang dari awal.");
+            }
+            
+            setInterval(generateSpeedTables, 1000);
