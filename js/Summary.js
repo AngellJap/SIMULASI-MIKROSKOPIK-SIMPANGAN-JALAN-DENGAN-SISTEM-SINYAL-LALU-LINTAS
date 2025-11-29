@@ -1,12 +1,5 @@
 // ======================================================================
-// Summary.js — Final version (per permintaan)
-// - Exports: initSummary(containerId), updateSummaryTable(), downloadSummaryCSV()
-// - Input IDs expected:
-//    motorn-<arah>-<i>, carn-<arah>-<i>, trukn-<arah>-<i>
-//    arus-<arah>-<i> (opsional; jika ada gunakan sebagai total lajur, jika tidak fallback ke MC+LV+HV)
-//    inNorth, inEast, inSouth, inWest
-//    durCycleTotal, durAllRed, durYellow
-//    fase-searah, fase-berhadapan, fase-berseberangan (active class)
+// Summary.js — Final version (Revisi Lengkap Arus & Antrian Nyata)
 // ======================================================================
 
 /* ===========================
@@ -30,27 +23,36 @@ export function initSummary(containerId = "summary-root") {
       <div class="summary-InOutpanel" style="overflow-x:auto;">
         <table id="summary-table" style="width:100%; border-collapse:collapse;">
           <thead>
-            <tr style="background:#333;color:#fff;text-align:center;">
-              <th>Arah</th>
-              <th>Lajur</th>
-              <th>Jumlah Lajur</th>
-              <th>Lebar Lajur (m)</th>
-              <th>MC (smp/jam)</th>
-              <th>LV (smp/jam)</th>
-              <th>HV (smp/jam)</th>
-              <th>Total Arus (smp/jam)</th>
-              <th>Truk (%)</th>
-              <th>Fase</th>
-              <th>Hijau (detik)</th>
-              <th>1 Siklus (detik)</th>
-              <th>Merah (detik)</th>
-              <th>Arus Jenuh (smp/jam)</th>
-              <th>SMP Hijau (smp)</th>
-              <th>Kapasitas (smp/jam)</th>
-              <th>Kapasitas TOTAL (smp/jam)</th>
-              <th>Arus Lalu Lintas (smp/jam)</th>
-              <th>Arus Lalu Lintas TOTAL (smp/jam)</th>
-              <th>Panjang Antrian (m)</th>
+            <tr style="background:#333; color:#fff; text-align:center;">
+              <th style="border:1px solid #999; padding:4px;">Arah</th>
+              <th style="border:1px solid #999; padding:4px;">Lajur</th>
+              <th style="border:1px solid #999; padding:4px;">Jumlah Lajur</th>
+              <th style="border:1px solid #999; padding:4px;">Lebar Lajur (m)</th>
+              <th style="border:1px solid #999; padding:4px;">MC (smp/jam)</th>
+              <th style="border:1px solid #999; padding:4px;">LV (smp/jam)</th>
+              <th style="border:1px solid #999; padding:4px;">HV (smp/jam)</th>
+              <th style="border:1px solid #999; padding:4px;">Total Arus (smp/jam)</th>
+              <th style="border:1px solid #999; padding:4px;">Truk (%)</th>
+              <th style="border:1px solid #999; padding:4px;">Fase</th>
+              <th style="border:1px solid #999; padding:4px;">Hijau (detik)</th>
+              <th style="border:1px solid #999; padding:4px;">1 Siklus (detik)</th>
+              <th style="border:1px solid #999; padding:4px;">Merah (detik)</th>
+              <th style="border:1px solid #999; padding:4px;">Arus Jenuh (smp/jam)</th>
+              <th style="border:1px solid #999; padding:4px;">SMP Hijau (smp)</th>
+              <th style="border:1px solid #999; padding:4px;">Kapasitas (smp/jam)</th>
+              <th style="border:1px solid #999; padding:4px;">Kapasitas TOTAL (smp/jam)</th>
+              
+              <th style="border:1px solid #999; padding:4px;">Arus LL (Teori)</th>
+              <th style="border:1px solid #999; padding:4px;">Arus LL TOTAL (Teori)</th>
+
+              <!-- KOLOM REAL-TIME (Biru Muda) -->
+              <th style="border:1px solid #999; padding:4px; background:#e6f7ff; color:#000;">Arus LL Nyata (smp/jam)</th>
+              <th style="border:1px solid #999; padding:4px; background:#e6f7ff; color:#000;">Total Arus Nyata (smp/jam)</th>
+
+              <th style="border:1px solid #999; padding:4px;">Panjang Antrian (Teori)</th>
+
+              <!-- KOLOM REAL-TIME (Merah Muda) -->
+              <th style="border:1px solid #999; padding:4px; background:#fff1f0; color:#000;">Panjang Antrian Nyata (m)</th>
             </tr>
           </thead>
           <tbody id="summary-tbody"></tbody>
@@ -86,13 +88,9 @@ export function initSummary(containerId = "summary-root") {
    1. Helper functions
    =========================== */
 
-/** readNumberById(id, fallback)
- * - reads .value or .textContent and returns numeric value or fallback
- */
 function readNumberById(id, fallback = 0) {
   const el = document.getElementById(id);
   if (!el) return fallback;
-  // use value if present, else textContent
   const raw = (el.value !== undefined && el.value !== null && el.value !== '') ? el.value : el.textContent;
   const v = parseFloat(String(raw).replace(/,/g, ''));
   return Number.isFinite(v) ? v : fallback;
@@ -111,68 +109,39 @@ function getPhase() {
 }
 
 /* ===========================
-   2. Core formulas (easily editable)
-   - If you want to change formulas manually, edit here.
+   2. Core formulas
    =========================== */
 
-// lane width default (meters)
 const LANE_WIDTH_M = 3;
 
-/** hitungWaktuHijau(fase, siklus, durAllRed, durYellow)
- *  per spesifikasi:
- *  - searah: hijau = siklus/4 - durAllRed - durYellow
- *  - berhadapan/berseberangan: hijau = siklus/2 - durAllRed - durYellow
- */
 function hitungWaktuHijau(fase, siklus, durAllRed, durYellow) {
   if (fase === "searah") return siklus / 4 - durAllRed - durYellow;
   return siklus / 2 - durAllRed - durYellow;
 }
 
-/** hitungWaktuMerah(fase, siklus)
- *  per spesifikasi:
- *  - searah: merah = 3/4 * siklus
- *  - berhadapan/berseberangan: merah = 1/2 * siklus
- *  (all-red & yellow ignored in merah)
- */
 function hitungWaktuMerah(fase, siklus) {
   if (fase === "searah") return (3 / 4) * siklus;
   return (1 / 2) * siklus;
 }
 
-/** hitungArusJenuhPerLajur(persenTruk)
- *  S = 1900 * 0.92 * (1/(1 + trukFraction*(2-1))) * 1 * 1 * 1 * 0.9
- *  persenTruk is in percent (0..100)
- */
 function hitungArusJenuhPerLajur(persenTruk) {
   const frac = (persenTruk || 0) / 100;
   return 1900 * 0.92 * (1 / (1 + frac * 1)) * 1 * 1 * 1 * 0.9;
 }
 
-/** hitungQPerLajur(MC, LV, HV)
- *  Q = LV + 1.3*HV + 0.2*MC
- */
 function hitungQPerLajur(MC = 0, LV = 0, HV = 0) {
   return LV + 1.3 * HV + 0.2 * MC;
 }
 
-/** hitungSmpHijauPerLajur(totalArusLajur, waktuMerah)
- *  smpHijau = totalArusLajur * waktuMerah / 3600
- */
 function hitungSmpHijauPerLajur(totalArusLajur, waktuMerah) {
   return (totalArusLajur * waktuMerah) / 3600;
 }
 
-/** hitungKapasitasPerLajur(S_perLajur, waktuHijau, siklus)
- *  Kapasitas per LAJUR = S * waktuHijau / siklus
- */
 function hitungKapasitasPerLajur(S_perLajur, waktuHijau, siklus) {
   if (!siklus || siklus <= 0) return 0;
   return (S_perLajur * waktuHijau) / siklus;
 }
 
-/** hitungPanjangAntrianPerLajur(smpHijau, lebarLajur)
- *  panjang = smpHijau * 20 / lebarLajur
- */
 function hitungPanjangAntrianPerLajur(smpHijau, lebarLajur = LANE_WIDTH_M) {
   if (!lebarLajur) return 0;
   return (smpHijau * 20) / lebarLajur;
@@ -180,12 +149,10 @@ function hitungPanjangAntrianPerLajur(smpHijau, lebarLajur = LANE_WIDTH_M) {
 
 /* ===========================
    3. Main: updateSummaryTable
-   - builds rowsByDir (per arah) with per-lajur details
    =========================== */
-export function updateSummaryTable() {
+export function updateSummaryTable(config, realTimeData = {}) {
   const tbody = document.getElementById("summary-tbody");
   if (!tbody) return;
-  tbody.innerHTML = "";
 
   // directions
   const directions = [
@@ -195,47 +162,38 @@ export function updateSummaryTable() {
     { key: "barat", selectId: "inWest", label: "Barat" }
   ];
 
-  const MAX_LANES = 5; // always render 1..5
+  const MAX_LANES = 5; 
   const laneWidth = LANE_WIDTH_M;
 
-  // read cycle & phase
   const siklus = readNumberById("durCycleTotal", 60);
   const durAllRed = readNumberById("durAllRed", 0);
   const durYellow = readNumberById("durYellow", 0);
   const fase = getPhase();
 
-  // per-direction results container
   const rowsByDir = [];
 
-  // loop directions
   directions.forEach(dir => {
     const jumlahLajur = Math.max(0, parseInt(document.getElementById(dir.selectId)?.value || 0));
 
-    // precompute green & red for the given phase (same for lajur in same direction)
     let waktuHijau = hitungWaktuHijau(fase, siklus, durAllRed, durYellow);
-    if (waktuHijau <= 0) waktuHijau = 0.001; // prevent divide by zero
+    if (waktuHijau <= 0) waktuHijau = 0.001;
     const waktuMerah = hitungWaktuMerah(fase, siklus);
 
-    // per-lajur array
     const lanes = [];
-    // totals per direction (for total columns)
     let totalKapasitasArah = 0;
-    let totalArusLL_Arah = 0; // arus lalu lintas total per arah (sum of Q per lajur)
-    // we will also count active lajur to compute totals from only active lajur
-    let activeLajurCount = 0;
+    let totalArusLL_Arah = 0;
+    let totalArusNyataArah = 0;
 
     for (let i = 1; i <= MAX_LANES; i++) {
-      // read inputs for this lajur
       const idMC = `motorn-${dir.key}-${i}`;
       const idLV = `carn-${dir.key}-${i}`;
       const idHV = `trukn-${dir.key}-${i}`;
-      const idArus = `arus-${dir.key}-${i}`; // optional total lajur input
+      const idArus = `arus-${dir.key}-${i}`;
 
       const MC = readNumberById(idMC, 0);
       const LV = readNumberById(idLV, 0);
       const HV = readNumberById(idHV, 0);
 
-      // totalArusLajur preference: use arus-... if exists & non-zero, else fallback to MC+LV+HV
       let totalArusLajur = null;
       const arusInputEl = document.getElementById(idArus);
       if (arusInputEl) {
@@ -243,39 +201,27 @@ export function updateSummaryTable() {
         if (rawArus !== null && rawArus !== 0) totalArusLajur = rawArus;
       }
       if (totalArusLajur === null) {
-        // fallback to MC+LV+HV
         const sumComp = MC + LV + HV;
         totalArusLajur = sumComp > 0 ? sumComp : 0;
       }
 
-      // if lajur has no input (all zeros) AND it's beyond jumlahLajur, mark as inactive
-      const isActive = (i <= jumlahLajur) && (MC !== 0 || LV !== 0 || HV !== 0 || (document.getElementById(idArus) && readNumberById(idArus, 0) !== 0));
-      if (i <= jumlahLajur && (MC !== 0 || LV !== 0 || HV !== 0 || readNumberById(idArus, 0) !== 0)) activeLajurCount++;
-
-      // composition based on components
       const compSum = MC + LV + HV;
       const persenTruk = compSum > 0 ? roundNum((HV / compSum) * 100, 2) : 0;
 
-      // per-lajur calculations:
-      // Arus Jenuh per lajur (S)
       const S_lajur = hitungArusJenuhPerLajur(persenTruk);
-
-      // SMP Hijau per lajur
       const smpHijau_lajur = hitungSmpHijauPerLajur(totalArusLajur, waktuMerah);
-
-      // Kapasitas per lajur
       const kapasitas_lajur = hitungKapasitasPerLajur(S_lajur, waktuHijau, siklus);
-
-      // Arus Lalu Lintas per lajur (Q)
       const arusLL_lajur = hitungQPerLajur(MC, LV, HV);
-
-      // Panjang antrian per lajur
       const panjang_lajur = hitungPanjangAntrianPerLajur(smpHijau_lajur, laneWidth);
 
-      // accumulate totals per direction for only active lajur
+      // Ambil Data Real-Time
+      const keyData = `${dir.label}-${i}`; 
+      const stats = realTimeData[keyData] || { flow: 0, queue: 0 };
+
       if (i <= jumlahLajur) {
         totalKapasitasArah += kapasitas_lajur;
         totalArusLL_Arah += arusLL_lajur;
+        totalArusNyataArah += stats.flow;
       }
 
       lanes.push({
@@ -288,11 +234,12 @@ export function updateSummaryTable() {
         smpHijau_lajur,
         kapasitas_lajur,
         arusLL_lajur,
-        panjang_lajur
+        panjang_lajur,
+        arusNyata_lajur: stats.flow, 
+        antrianNyata_lajur: stats.queue
       });
-    } // end per lajur loop
+    }
 
-    // store aggregated info per direction
     rowsByDir.push({
       arah: dir.label,
       key: dir.key,
@@ -304,22 +251,19 @@ export function updateSummaryTable() {
       waktuMerah,
       lanes,
       totalKapasitasArah: roundNum(totalKapasitasArah, 2),
-      totalArusLL_Arah: roundNum(totalArusLL_Arah, 2)
+      totalArusLL_Arah: roundNum(totalArusLL_Arah, 2),
+      totalArusNyataArah: roundNum(totalArusNyataArah, 0)
     });
-  }); // end directions
+  });
 
-  // cache rows for CSV
   window.__summary_cache = window.__summary_cache || {};
   window.__summary_cache.rowsByDir = rowsByDir;
 
-  // render table
-  renderTable(rowsByDir);
+ renderTable(rowsByDir);
 }
 
 /* ===========================
    4. Render Table (DOM)
-   - respects column order requested
-   - Kapasitas TOTAL & Arus Lalu Lintas TOTAL displayed on first row (rowspan)
    =========================== */
 function renderTable(rowsByDir) {
   const tbody = document.getElementById("summary-tbody");
@@ -328,70 +272,67 @@ function renderTable(rowsByDir) {
 
   rowsByDir.forEach(dir => {
     const lanes = dir.lanes;
-    const rowSpan = lanes.length; // 5
+    const rowSpan = lanes.length; 
 
     lanes.forEach((ln, idx) => {
       const tr = document.createElement("tr");
 
-      // 1. Arah (rowspan)
+      // 1. Arah (Rowspan)
       if (idx === 0) tr.appendChild(makeTd(dir.arah, true, rowSpan));
-
-      // 2. Lajur (per-row)
+      // 2. Lajur
       tr.appendChild(makeTd(ln.lajur));
-
-      // 3. Jumlah Lajur (rowspan)
+      // 3. Jumlah Lajur (Rowspan)
       if (idx === 0) tr.appendChild(makeTd(dir.jumlahLajur, true, rowSpan));
-
-      // 4. Lebar Lajur (m) (rowspan)
+      // 4. Lebar Lajur (Rowspan)
       if (idx === 0) tr.appendChild(makeTd(dir.laneWidth + " m", true, rowSpan));
 
-      // 5. MC
+      // ... Kolom input MC/LV/HV/Total/Truk% ...
       tr.appendChild(makeTd(ln.MC !== 0 ? roundNum(ln.MC, 2) : "-"));
-
-      // 6. LV
       tr.appendChild(makeTd(ln.LV !== 0 ? roundNum(ln.LV, 2) : "-"));
-
-      // 7. HV
       tr.appendChild(makeTd(ln.HV !== 0 ? roundNum(ln.HV, 2) : "-"));
-
-      // 8. Total Arus (per lajur)
       tr.appendChild(makeTd(ln.totalArusLajur ? roundNum(ln.totalArusLajur, 2) : "-"));
+      tr.appendChild(makeTd(ln.active ? (roundNum(ln.persenTruk, 2) + "%") : "-"));
 
-      // 9. Truk (% per lajur)
-      tr.appendChild(makeTd(ln.active ? (roundNum(ln.persenTruk,2) + "%") : "-"));
-
-      // 10. Fase (rowspan)
+      // ... Kolom Fase/Waktu (Rowspan) ...
       if (idx === 0) tr.appendChild(makeTd(dir.fase, true, rowSpan));
-
-      // 11. Hijau (detik) (rowspan)
       if (idx === 0) tr.appendChild(makeTd(roundNum(dir.waktuHijau, 2), true, rowSpan));
-
-      // 12. 1 Siklus (detik) (rowspan)
       if (idx === 0) tr.appendChild(makeTd(roundNum(dir.siklus, 2), true, rowSpan));
-
-      // 13. Merah (detik) (rowspan)
       if (idx === 0) tr.appendChild(makeTd(roundNum(dir.waktuMerah, 2), true, rowSpan));
 
-      // 14. Arus Jenuh (smp/jam) per lajur
-      tr.appendChild(makeTd(ln.active ? roundNum(ln.S_lajur, 2) : "-"));
+      // ... Kolom Kalkulasi Teori ...
+      tr.appendChild(makeTd(ln.active ? roundNum(ln.S_lajur, 0) : "-")); // Arus Jenuh
+      tr.appendChild(makeTd(ln.smpHijau_lajur ? roundNum(ln.smpHijau_lajur, 2) : "-")); // SMP Hijau
+      tr.appendChild(makeTd(ln.active ? roundNum(ln.kapasitas_lajur, 0) : "-")); // Kapasitas
+      
+      // Kapasitas TOTAL (Rowspan)
+      if (idx === 0) tr.appendChild(makeTd(roundNum(dir.totalKapasitasArah, 0), true, rowSpan));
 
-      // 15. SMP Hijau (per lajur)
-      tr.appendChild(makeTd(ln.smpHijau_lajur ? roundNum(ln.smpHijau_lajur, 3) : "-"));
+      // Arus LL Teori per lajur
+      tr.appendChild(makeTd(ln.arusLL_lajur ? roundNum(ln.arusLL_lajur, 0) : "-"));
+      // Arus LL Total Teori (Rowspan)
+      if (idx === 0) tr.appendChild(makeTd(roundNum(dir.totalArusLL_Arah, 0), true, rowSpan));
 
-      // 16. Kapasitas per lajur
-      tr.appendChild(makeTd(ln.active ? roundNum(ln.kapasitas_lajur, 2) : "-"));
+      // =========================================================
+      // KOLOM BARU: ARUS NYATA & ANTRIAN NYATA
+      // =========================================================
+      
+      // 1. Arus LL Nyata (Per Lajur)
+      // Tampilkan hanya jika lajur aktif, background biru muda
+      const valArusNyata = (ln.active && ln.arusNyata_lajur !== undefined) ? roundNum(ln.arusNyata_lajur, 0) : "-";
+      tr.appendChild(makeTd(valArusNyata, false, 1, "#e6f7ff"));
 
-      // 17. Kapasitas TOTAL (per arah) - shown in first row only
-      if (idx === 0) tr.appendChild(makeTd(dir.totalKapasitasArah ?? 0, true, rowSpan));
+      // 2. Total Arus Nyata (Per Arah - Rowspan)
+      if (idx === 0) {
+        const valTotalArus = roundNum(dir.totalArusNyataArah, 0);
+        tr.appendChild(makeTd(valTotalArus, true, rowSpan, "#e6f7ff"));
+      }
 
-      // 18. Arus Lalu Lintas (per lajur)
-      tr.appendChild(makeTd(ln.arusLL_lajur ? roundNum(ln.arusLL_lajur, 2) : "-"));
+      // 3. Panjang Antrian Teori
+      tr.appendChild(makeTd(ln.panjang_lajur ? roundNum(ln.panjang_lajur, 1) : "-"));
 
-      // 19. Arus Lalu Lintas TOTAL (per arah) - first row only
-      if (idx === 0) tr.appendChild(makeTd(dir.totalArusLL_Arah ?? 0, true, rowSpan));
-
-      // 20. Panjang Antrian (m) per lajur
-      tr.appendChild(makeTd(ln.panjang_lajur ? roundNum(ln.panjang_lajur, 2) : "-"));
+      // 4. Panjang Antrian Nyata (Per Lajur) - Background merah muda
+      const valAntrianNyata = (ln.active && ln.antrianNyata_lajur !== undefined) ? roundNum(ln.antrianNyata_lajur, 1) : 0;
+      tr.appendChild(makeTd(valAntrianNyata, false, 1, "#fff1f0"));
 
       tbody.appendChild(tr);
     });
@@ -399,14 +340,18 @@ function renderTable(rowsByDir) {
 }
 
 /* ===========================
-   5. small helpers for rendering & CSV
+   5. Small helpers for rendering & CSV
    =========================== */
 
-function makeTd(value, rowspan = false, span = 1) {
+function makeTd(value, rowspan = false, span = 1, bg = null) {
   const td = document.createElement("td");
   td.style.padding = "6px";
   td.style.textAlign = "center";
-  td.style.border = "1px solid rgba(255,255,255,0.06)";
+  td.style.border = "1px solid rgba(0,0,0,0.2)"; 
+  td.style.color = "#000";
+  
+  if (bg) td.style.backgroundColor = bg;
+  
   td.textContent = (value === undefined || value === null || value === "") ? "-" : String(value);
   if (rowspan) {
     td.rowSpan = span;
@@ -414,10 +359,6 @@ function makeTd(value, rowspan = false, span = 1) {
   }
   return td;
 }
-
-/* ===========================
-   6. CSV Export (downloadSummaryCSV)
-   =========================== */
 
 export function downloadSummaryCSV() {
   const cache = window.__summary_cache || {};
@@ -429,36 +370,26 @@ export function downloadSummaryCSV() {
 
   const header = [
     "Arah","Lajur","JumlahLajur","LebarLajur(m)",
-    "MC(smp/jam)","LV(smp/jam)","HV(smp/jam)","TotalArus(smp/jam)","Truk(%)",
-    "Fase","Hijau(detik)","Siklus(detik)","Merah(detik)",
-    "ArusJenuh(smp/jam)","SMPHijau(smp)","Kapasitas(smp/jam)","KapasitasTotal(smp/jam)",
-    "ArusLaluLintas(smp/jam)","ArusLaluLintasTotal(smp/jam)","PanjangAntrian(m)"
+    "MC","LV","HV","TotalArus","Truk(%)",
+    "Fase","Hijau","Siklus","Merah",
+    "ArusJenuh","SMPHijau","Kapasitas","KapasitasTotal",
+    "ArusLL(Teori)","ArusLLTotal(Teori)",
+    "ArusLL(Nyata)","ArusLLTotal(Nyata)",
+    "PanjangAntrian(Teori)","PanjangAntrian(Nyata)"
   ];
   const lines = [header.join(",")];
 
   rowsByDir.forEach(dir => {
     dir.lanes.forEach(ln => {
       lines.push([
-        dir.arah,
-        ln.lajur,
-        dir.jumlahLajur,
-        dir.laneWidth,
-        ln.MC,
-        ln.LV,
-        ln.HV,
-        ln.totalArusLajur,
-        ln.persenTruk,
-        dir.fase,
-        roundNum(dir.waktuHijau,2),
-        roundNum(dir.siklus,2),
-        roundNum(dir.waktuMerah,2),
-        roundNum(ln.S_lajur,2),
-        roundNum(ln.smpHijau_lajur,3),
-        roundNum(ln.kapasitas_lajur,2),
-        roundNum(dir.totalKapasitasArah,2),
-        roundNum(ln.arusLL_lajur,2),
-        roundNum(dir.totalArusLL_Arah,2),
-        roundNum(ln.panjang_lajur,2)
+        dir.arah, ln.lajur, dir.jumlahLajur, dir.laneWidth,
+        ln.MC, ln.LV, ln.HV, ln.totalArusLajur, ln.persenTruk,
+        dir.fase, roundNum(dir.waktuHijau,2), roundNum(dir.siklus,2), roundNum(dir.waktuMerah,2),
+        roundNum(ln.S_lajur,2), roundNum(ln.smpHijau_lajur,3), roundNum(ln.kapasitas_lajur,2), roundNum(dir.totalKapasitasArah,2),
+        roundNum(ln.arusLL_lajur,2), roundNum(dir.totalArusLL_Arah,2),
+        // Data Nyata di CSV
+        roundNum(ln.arusNyata_lajur, 0), roundNum(dir.totalArusNyataArah, 0),
+        roundNum(ln.panjang_lajur,2), roundNum(ln.antrianNyata_lajur, 1)
       ].join(","));
     });
   });
@@ -471,11 +402,3 @@ export function downloadSummaryCSV() {
   a.click();
   a.remove();
 }
-
-/* ===========================
-   NOTES / TIPS
-   - Jika beberapa nilai tampil '-', periksa ID input yang terkait.
-   - Untuk ubah rumus: edit fungsi di bagian 2 (Core formulas).
-   - Untuk membuat kapasitas total dihitung berbeda, ubah akumulasi totalKapasitasArah di loop per arah.
-   - Lebar lajur default di LANE_WIDTH_M (ubah di atas jika ingin 3 -> 2.75 dsb)
-   =========================== */
