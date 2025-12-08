@@ -1,5 +1,9 @@
 // vehmov.js (dua-titik axle model: rear & front mengikuti path — truk seperti gerbong)
-// REVISI: Perbaikan sinkronisasi poros depan/belakang agar titik putih tidak "nge-jerk"
+// REVISI: 
+// 1. Integrasi Saklar Debug (Toggle Visual).
+// 2. Optimasi Culling (Tidak gambar debug object di luar layar).
+// 3. Perbaikan sinkronisasi poros depan/belakang agar titik putih tidak "nge-jerk".
+
 import { SpeedLogger } from "./SpeedLogger.js";
 
 export function createVehMovController(options = {}) {
@@ -16,6 +20,13 @@ export function createVehMovController(options = {}) {
   const cy = canvasSize.height / 2;
   const centerRadius = 150; // area tengah simpang
   const ANGLE_ADJUST = Math.PI;
+
+  // === GLOBAL LOCK UNTUK TRUCK TURN PROTECTION ===
+const turningTruckLock = {
+    active: false,
+    ownerId: null,
+    blockedList: []
+};
 
   const truckWheelbaseMeters = options.truckWheelbaseMeters ?? 5.8;
   const truckLengthMeters = options.truckLengthMeters ?? 12.0;
@@ -159,6 +170,52 @@ export function createVehMovController(options = {}) {
     }
   }
   try { buildSpawnRadars(); } catch (e) {}
+
+  function computeBlockedLanesForTurningTruck(truck) {
+    if (!truck || !Array.isArray(vehicles)) return [];
+
+    const blocked = new Set();
+    const SAFETY = 80; // buffer pantat truk
+
+    const bb = truck.debugBox;
+    if (!bb) return [];
+
+    const minX = bb.minX - SAFETY;
+    const maxX = bb.maxX + SAFETY;
+    const minY = bb.minY - SAFETY;
+    const maxY = bb.maxY + SAFETY;
+
+    for (const other of vehicles) {
+        if (!other || other.id === truck.id) continue;
+
+        const ob = other.debugBox;
+        if (!ob) continue;
+
+        if (ob.maxX >= minX && ob.minX <= maxX &&
+            ob.maxY >= minY && ob.minY <= maxY) {
+
+            const key = `${other.direction}|${other.laneIndex}`;
+            blocked.add(key);
+        }
+    }
+
+    return Array.from(blocked).map(k => {
+        const [dir, lane] = k.split("|");
+        return { direction: dir, laneIndex: Number(lane) };
+    });
+}
+
+function updateTruckSweepArea(truck) {
+    if (!truck || !truck.debugBox) return null;
+
+    const SAFETY = 90; // buffer untuk pantat truk
+    return {
+        minX: truck.debugBox.minX - SAFETY,
+        maxX: truck.debugBox.maxX + SAFETY,
+        minY: truck.debugBox.minY - SAFETY,
+        maxY: truck.debugBox.maxY + SAFETY
+    };
+}
 
   function updateSpawnRadarsCenters() {
     for (const dir of ['utara','timur','selatan','barat']) {
@@ -722,7 +779,7 @@ freeFlowKmh: (() => {
       v.spriteOffsetRearPx = frontToFirstRearPx + firstRearToSecondRearPx + rearOverhangPx;
       v.wheelbase = frontToFirstRearPx;
       // Use requested canvas sizes (1:1)
-      v.lengthPx = 120; // truck length in px
+      v.lengthPx = truckLengthMeters * PX_PER_M;
       v.widthPx = 25;   // truck width in px
     } else {
       v.axles = { frontOverhangPx: 0, rearOverhangPx: 0 };
@@ -1210,7 +1267,7 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
       const reactionMs = (typeof v._reactionMs === 'number') ? v._reactionMs : DEFAULT_REACTION_MS;
       // baseSpeed may be passed in px/ms; if user used m/s, they must convert externally
       const baseSpeed = (typeof options.baseSpeed === 'number') ? options.baseSpeed : mps_to_px_per_ms(10); // default 10 m/s
-      const BOOST_FACTOR = 10; // percepatan ekstra di tengah simpang
+      const BOOST_FACTOR = 1; // percepatan ekstra di tengah simpang
 
       // detect vehicle ahead
       const ahead = findVehicleAhead(v);
@@ -1284,13 +1341,117 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
       // then apply movement same as before but using v.speed as travel rate
       let moveBudget = v.speed * deltaMs;
 
-      // FIX DRIFT: Jika target 0 dan speed sudah 0, jangan ada budget gerak sama sekali
-      if (desired <= EPS && v.speed <= EPS) {
-          v.speed = 0;
-          moveBudget = 0;
-      }
+      // =======================================
+// 🚧 TRUCK TURN SAFETY SYSTEM (AUTO MODE)
+// =======================================
+
+// 1) Jika ini truk, cek apakah sedang belok (rotation bukan sudut lurus)
+if (v.vehicleType === "truck") {
+
+    const straightAngles = [0, 90, 180, -90, 270];
+    const isStraight = straightAngles.some(a => Math.abs(v.rotation - a) < 3);
+
+    // aktifkan lock saat sudut tidak lurus (belok)
+    if (!isStraight && turningTruckLock.ownerId === null) {
+        turningTruckLock.active = true;
+        turningTruckLock.ownerId = v.id;
+    }
+
+    // update sweep area jika lock pemilik
+    if (turningTruckLock.ownerId === v.id && v.debugBox) {
+        const SAFETY = 120;
+        turningTruckLock.sweepBox = {
+            minX: v.debugBox.minX - SAFETY,
+            maxX: v.debugBox.maxX + SAFETY,
+            minY: v.debugBox.minY - SAFETY,
+            maxY: v.debugBox.maxY + SAFETY
+        };
+    }
+
+    // Lepas lock kalau sudah selesai belok (rotasi lurus lagi)
+    if (turningTruckLock.ownerId === v.id && isStraight) {
+        turningTruckLock.active = false;
+        turningTruckLock.ownerId = null;
+        turningTruckLock.sweepBox = null;
+    }
+}
+
+
+// 2) STOP semua kendaraan lain yang masuk sweep area
+if (turningTruckLock.active && turningTruckLock.sweepBox && v.debugBox && v.id !== turningTruckLock.ownerId) {
+
+    const sb = turningTruckLock.sweepBox;
+    const bb = v.debugBox;
+
+    const overlap =
+        bb.maxX >= sb.minX &&
+        bb.minX <= sb.maxX &&
+        bb.maxY >= sb.minY &&
+        bb.minY <= sb.maxY;
+
+    if (overlap) {
+        v.speed = 0;
+        moveBudget = 0;
+        continue;
+    }
+}
+
+// === PRIORITY STOP: ANTI TABRAKAN PANTAT TRUK ===
+if (turningTruckLock.active && v.id !== turningTruckLock.ownerId) {
+    const owner = vehicles.find(x => x.id === turningTruckLock.ownerId);
+    if (owner) turningTruckLock.blockedList = computeBlockedLanesForTurningTruck(owner);
+    let mustStop = turningTruckLock.blockedList.some(b => b.direction === v.direction && b.laneIndex === v.laneIndex);
+    if (mustStop) {
+        v.speed = 0;
+        moveBudget = 0;
+        continue;
+    }
+}
+
+// === ACTIVATE LOCK WHEN TRUCK STARTS TURNING ===
+if (v.type === "truk" && v.turning && turningTruckLock.ownerId === null && v.turnTraveled < 10) {
+    turningTruckLock.active = true;
+    turningTruckLock.ownerId = v.id;
+    turningTruckLock.blockedList = computeBlockedLanesForTurningTruck(v);
+}
+
+// === RELEASE LOCK WHEN TURN FINISHED ===
+if (v.type === "truk" && turningTruckLock.ownerId === v.id && !v.turning) {
+    turningTruckLock.active = false;
+    turningTruckLock.ownerId = null;
+    turningTruckLock.blockedList = [];
+}
+
+// FIX DRIFT
+if (desired <= EPS && v.speed <= EPS) {
+    v.speed = 0;
+    moveBudget = 0;
+}
 
       while (moveBudget > EPS) {
+        // ====== SISTEM ANTI TABRAKAN PANTAT TRUK ======
+if (turningTruckLock.active && v.id !== turningTruckLock.ownerId) {
+
+    // update block list real-time mengikuti belokan
+    turningTruckLock.blockedList = computeBlockedLanesForTurningTruck(
+        vehicles.find(x => x.id === turningTruckLock.ownerId)
+    );
+
+    let stop = false;
+    for (const b of turningTruckLock.blockedList) {
+        if (b.direction === v.direction && b.laneIndex === v.laneIndex) {
+            stop = true;
+            break;
+        }
+    }
+
+    if (stop) {
+        v.speed = 0;
+        moveBudget = 0;
+        break;
+    }
+}
+
         // approachingTurn: find closest on path -> create blend or snap
         if (v.approachingTurn && v.path) {
           const centerOffset = v.wheelbase * 0.5;
@@ -1407,6 +1568,11 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
         // turning along path (two-axle follower)
         if (v.turning && v.path) {
           if (v.turnLength <= 0) v.turnLength = v.path.totalLength || 1;
+          if (v.type === 'truk' && turningTruckLock.ownerId === v.id) {
+    turningTruckLock.active = false;
+    turningTruckLock.ownerId = null;
+    turningTruckLock.blockedList = [];
+}
           const remainingOnPath = Math.max(0, v.turnLength - v.turnTraveled);
           if (remainingOnPath <= 0.001) {
             // finished path: snap final heading and clear path to avoid flicker
@@ -1503,6 +1669,10 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
       try {
         // As a safety: if vehicle is NOT following path or blend, ensure axles are in sync
         if (!v.turning && !v.blend) {
+          if (v.type === 'truk') {
+    turningTruckLock.active = true;
+    turningTruckLock.ownerId = v.id;
+}
           let h = null;
           if (typeof v.vx === 'number' && typeof v.vy === 'number' && (Math.abs(v.vx) > 1e-9 || Math.abs(v.vy) > 1e-9)) {
             h = Math.atan2(v.vy, v.vx);
@@ -1534,7 +1704,15 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
 
   // ---------- debug draw ----------
   function drawDebugPoints(ctx) {
+    // 1. Cek Saklar (ID: debugShowPoints)
+    const toggle = document.getElementById("debugShowPoints");
+    if (toggle && !toggle.checked) return;
+
     vehicles.forEach(v => {
+      // 2. Culling: Jangan gambar jika jauh di luar layar
+      if (v.x < -100 || v.x > canvasSize.width + 100 || 
+          v.y < -100 || v.y > canvasSize.height + 100) return;
+
       // Ensure debugBox exists so corner dots are correct
       if (!v.debugBox) {
         try { computeDebugBoxForVehicle(v); } catch (e) {}
@@ -1581,67 +1759,21 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
         }
         ctx.restore();
       }
-
-      // ===== NEW: draw laser lines (green) if enabled =====
-      if (LASER_DRAW_ENABLED && v._laser) {
-        ctx.save();
-        ctx.lineWidth = 2;
-
-        // center ray (compat)
-        if (v._laser.center && v._laser.center.start && v._laser.center.end) {
-          ctx.beginPath();
-          ctx.moveTo(v._laser.center.start.x, v._laser.center.start.y);
-          ctx.lineTo(v._laser.center.end.x, v._laser.center.end.y);
-          ctx.strokeStyle = v._laser.center.hit ? "lime" : "rgba(0,255,0,0.6)";
-          ctx.stroke();
-          if (v._laser.center.hit && v._laser.center.hitPoint) {
-            ctx.fillStyle = "lime";
-            ctx.beginPath();
-            ctx.arc(v._laser.center.hitPoint.x, v._laser.center.hitPoint.y, 3, 0, Math.PI*2);
-            ctx.fill();
-          }
-        }
-
-        // left corner ray
-        if (v._laser.left && v._laser.left.start && v._laser.left.end) {
-          ctx.beginPath();
-          ctx.moveTo(v._laser.left.start.x, v._laser.left.start.y);
-          ctx.lineTo(v._laser.left.end.x, v._laser.left.end.y);
-          ctx.strokeStyle = v._laser.left.hit ? "lime" : "rgba(0,220,0,0.5)";
-          ctx.stroke();
-          if (v._laser.left.hit && v._laser.left.hitPoint) {
-            ctx.fillStyle = "lime";
-            ctx.beginPath();
-            ctx.arc(v._laser.left.hitPoint.x, v._laser.left.hitPoint.y, 3, 0, Math.PI*2);
-            ctx.fill();
-          }
-        }
-
-        // right corner ray
-        if (v._laser.right && v._laser.right.start && v._laser.right.end) {
-          ctx.beginPath();
-          ctx.moveTo(v._laser.right.start.x, v._laser.right.start.y);
-          ctx.lineTo(v._laser.right.end.x, v._laser.right.end.y);
-          ctx.strokeStyle = v._laser.right.hit ? "lime" : "rgba(0,200,0,0.45)";
-          ctx.stroke();
-          if (v._laser.right.hit && v._laser.right.hitPoint) {
-            ctx.fillStyle = "lime";
-            ctx.beginPath();
-            ctx.arc(v._laser.right.hitPoint.x, v._laser.right.hitPoint.y, 3, 0, Math.PI*2);
-            ctx.fill();
-          }
-        }
-
-        ctx.restore();
-      }
-      // ================================================================================
-
     });
   }
 
   function drawDebugPaths(ctx) {
+    // 1. Cek Saklar (ID: debugShowPaths)
+    const toggle = document.getElementById("debugShowPaths");
+    if (toggle && !toggle.checked) return;
+
     vehicles.forEach(v => {
       if (!v.path) return;
+
+      // 2. Culling: Jangan gambar jika jauh di luar layar
+      if (v.x < -100 || v.x > canvasSize.width + 100 || 
+          v.y < -100 || v.y > canvasSize.height + 100) return;
+
       ctx.save();
       ctx.strokeStyle = "rgba(0,0,0,0.15)";
       ctx.lineWidth = 1;
@@ -1665,7 +1797,15 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
 
   // ---------- kotak debug fisik kendaraan (visual draw) ----------
   function drawDebugBoxes(ctx) {
+    // 1. Cek Saklar (ID: debugShowHitbox)
+    const toggle = document.getElementById("debugShowHitbox");
+    if (toggle && !toggle.checked) return;
+
     vehicles.forEach(v => {
+      // 2. Culling: Jangan gambar jika jauh di luar layar
+      if (v.x < -100 || v.x > canvasSize.width + 100 || 
+          v.y < -100 || v.y > canvasSize.height + 100) return;
+
       if (!v.debugBox) computeDebugBoxForVehicle(v);
       const db = v.debugBox;
       if (!db || !db.corners) return;
@@ -1729,6 +1869,59 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
       }
 
       ctx.restore();
+
+      // ===== NEW: draw laser lines (green) if enabled =====
+      if (LASER_DRAW_ENABLED && v._laser) {
+        ctx.save();
+        ctx.lineWidth = 2;
+
+        // center ray (compat)
+        if (v._laser.center && v._laser.center.start && v._laser.center.end) {
+          ctx.beginPath();
+          ctx.moveTo(v._laser.center.start.x, v._laser.center.start.y);
+          ctx.lineTo(v._laser.center.end.x, v._laser.center.end.y);
+          ctx.strokeStyle = v._laser.center.hit ? "lime" : "rgba(0,255,0,0.6)";
+          ctx.stroke();
+          if (v._laser.center.hit && v._laser.center.hitPoint) {
+            ctx.fillStyle = "lime";
+            ctx.beginPath();
+            ctx.arc(v._laser.center.hitPoint.x, v._laser.center.hitPoint.y, 3, 0, Math.PI*2);
+            ctx.fill();
+          }
+        }
+
+        // left corner ray
+        if (v._laser.left && v._laser.left.start && v._laser.left.end) {
+          ctx.beginPath();
+          ctx.moveTo(v._laser.left.start.x, v._laser.left.start.y);
+          ctx.lineTo(v._laser.left.end.x, v._laser.left.end.y);
+          ctx.strokeStyle = v._laser.left.hit ? "lime" : "rgba(0,220,0,0.5)";
+          ctx.stroke();
+          if (v._laser.left.hit && v._laser.left.hitPoint) {
+            ctx.fillStyle = "lime";
+            ctx.beginPath();
+            ctx.arc(v._laser.left.hitPoint.x, v._laser.left.hitPoint.y, 3, 0, Math.PI*2);
+            ctx.fill();
+          }
+        }
+
+        // right corner ray
+        if (v._laser.right && v._laser.right.start && v._laser.right.end) {
+          ctx.beginPath();
+          ctx.moveTo(v._laser.right.start.x, v._laser.right.start.y);
+          ctx.lineTo(v._laser.right.end.x, v._laser.right.end.y);
+          ctx.strokeStyle = v._laser.right.hit ? "lime" : "rgba(0,200,0,0.45)";
+          ctx.stroke();
+          if (v._laser.right.hit && v._laser.right.hitPoint) {
+            ctx.fillStyle = "lime";
+            ctx.beginPath();
+            ctx.arc(v._laser.right.hitPoint.x, v._laser.right.hitPoint.y, 3, 0, Math.PI*2);
+            ctx.fill();
+          }
+        }
+
+        ctx.restore();
+      }
     });
     try { ctx.globalAlpha = 1.0; } catch (e) {}
   }
@@ -1750,8 +1943,8 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
           // pastikan property tersedia, dan normalisasikan kecil (sum -> 100) kalau perlu
           const flow = Math.max(0, Math.round(Number(l?.flow || 0)));
           let m = Number(l?.motorPct ?? l?.motor ?? 0) || 0;
-          let c = Number(l?.mobilPct ?? l?.carPct ?? l?.mobil ?? 0) || 0;
-          let t = Number(l?.trukPct ?? l?.truckPct ?? l?.truk ?? 0) || 0;
+          let c = Number(l?.mobilPct ?? l?.mobil ?? 0) || 0;
+          let t = Number(l?.trukPct ?? l?.truk ?? 0) || 0;
           const sum = m + c + t;
           if (sum === 0) {
             // fallback default
@@ -1771,7 +1964,7 @@ try { SpeedLogger.logFrame(v, PX_PER_M); } catch (e) {}
           const mobilPct = Math.max(0, Math.round(c));
           const trukPct = Math.max(0, Math.round(t));
           // provide aliases for compatibility
-          return { flow, motorPct, mobilPct, trukPct, carPct: mobilPct, truckPct: trukPct };
+          return { flow, motorPct, mobilPct, trukPct };
         });
       });
       console.debug("vehmov: laneTrafficConfig set", laneTrafficConfig);
