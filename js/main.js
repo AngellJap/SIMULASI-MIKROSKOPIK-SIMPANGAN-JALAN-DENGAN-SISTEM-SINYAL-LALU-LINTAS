@@ -1,10 +1,8 @@
 /**
- * main.js (revisi: memindahkan logika gerak kendaraan ke vehmov.js)
- * - Menambahkan objek laneCoordinates untuk menyimpan posisi (x, y) dari setiap lajur.
- * - Mengubah drawEntryLaneNumbers dan drawExitLaneNumbers agar menyimpan koordinat selain menggambarnya.
- * - Spawn & movement kendaraan didelegasikan ke vehmov.js (createVehMovController).
- * - MEMPERBAIKI URUTAN PENAMAAN LAJUR KELUAR UTARA DAN TIMUR
- * - Modifikasi: Menambahkan 'Belok Kiri Jalan Terus' (Global Switch)
+ * main.js (revisi: Sinkronisasi Saklar Debug & Optimasi Rendering)
+ * - Menambahkan logika saklar untuk ID Kendaraan.
+ * - Menambahkan Culling (filter batas layar) saat menggambar sprite kendaraan.
+ * - Memastikan tabel SpeedLogger tidak auto-refresh (beban berat hilang).
  */
 
 import { drawUtara } from './InfrastrukturJalan/utara.js';
@@ -21,23 +19,23 @@ import { updateAntrian, getRealTimeTrafficStats } from './antrian.js';
 import createSiklusLampu from './SiklusLampu.js';
 import { initSummary, updateSummaryTable } from './Summary.js';
 import { SpeedLogger } from "./SpeedLogger.js";
-import initPhaseModel from './phaseModel.js';
 import { downloadKonfigurasi, uploadKonfigurasi } from './ConfigManager.js';
 import { initReportExporter } from './ReportExporter.js';
 
 document.addEventListener('DOMContentLoaded', init);
 
 // 1. Listener Tombol Download
-    const btnDownload = document.getElementById('btnExportJson');
-    if (btnDownload) {
-        btnDownload.addEventListener('click', downloadKonfigurasi);
-    }
+const btnDownload = document.getElementById('btnExportJson');
+if (btnDownload) {
+    btnDownload.addEventListener('click', downloadKonfigurasi);
+}
 
-    // 2. Listener Input Upload
-    const inputUpload = document.getElementById('inputImportJson');
-    if (inputUpload) {
-        inputUpload.addEventListener('change', uploadKonfigurasi);
-    }
+// 2. Listener Input Upload
+const inputUpload = document.getElementById('inputImportJson');
+if (inputUpload) {
+    inputUpload.addEventListener('change', uploadKonfigurasi);
+}
+
 // === LTOR GLOBAL SWITCH ===
 document.getElementById("ltsorGlobalSwitch")
    .addEventListener("change", (e) => {
@@ -109,6 +107,19 @@ let realTrafficStats = {
   counts: {}
 };
 
+const speedSlider = document.getElementById("simSpeedSlider");
+const speedLabel  = document.getElementById("simSpeedVal");
+
+if(speedSlider){
+    speedLabel.textContent = simSpeed.toFixed(1) + "×";
+
+    speedSlider.addEventListener("input", () => {
+        simSpeed = parseFloat(speedSlider.value);
+        speedLabel.textContent = simSpeed.toFixed(1) + "×";
+        console.log("Simulation Speed:", simSpeed);
+    });
+}
+
 // ===== SIMULATION TIMER =====
 let simTimerStart = null;
 let simTimerElapsedMs = 0;
@@ -156,6 +167,7 @@ let laneTrafficConfig = {
     barat: []
 };
 // ---------------------------------------------------------------------
+window.laneTrafficConfig = laneTrafficConfig;
 
 // Ganti fungsi generateSpeedTables yang error dengan ini:
 function generateSpeedTables() {
@@ -316,6 +328,9 @@ function setActivePhaseButton(mode) {
 });
 // === TAMBAHAN MODEL 3 FASE SELESAI ===
 
+let laneArrows = { utara: [], timur: [], selatan: [], barat: [] };
+let exitLaneNumbers = { utara: [], timur: [], selatan: [], barat: [] };
+
 // === INISIALISASI MODEL FASE 1-7 ===
 try {
     initPhaseModel({
@@ -342,8 +357,6 @@ try {
         img.src = `js/arrowIcons/${type}.png`;
     }));
 
-    let laneArrows = { utara: [], timur: [], selatan: [], barat: [] };
-    let exitLaneNumbers = { utara: [], timur: [], selatan: [], barat: [] };
     function updateExitLaneNumbers() {
         ["utara", "timur", "selatan", "barat"].forEach(arah => {
             const totalOut = (config[arah] && config[arah].out) ? config[arah].out : 0;
@@ -593,14 +606,20 @@ if (ltorEl) {
         return result;
     }
 
-    // ------------------- BACA PER-LAJUR DARI DOM (ROBUST) -------------------
+    // ------------------- BACA PER-LAJUR DARI DOM (ROBUST & FIX BUG OVERWRITE) -------------------
     // - Mencari pola id (backwards compatibility)
     // - Jika tidak ada id, fallback ke DOM dinamis '#laneInputsContainer' dengan .lane-row
+    // - FIX: Jangan reset value ke default jika input untuk arah tersebut sedang disembunyikan UI
     function readLaneTrafficInputs() {
         console.debug('[main] readLaneTrafficInputs called');
+        if (window.__suspendTrafficUpdates) {
+    console.log("⏸️ readLaneTrafficInputs skipped (import mode)");
+    return;
+}
+        // rebuildLaneTrafficConfig hanya memastikan array cukup panjang, tidak mereset value yang sudah ada
         rebuildLaneTrafficConfig();
 
-        // helper untuk mencari elemen id pola (kembali kompatibel)
+        // helper untuk mencari elemen id pola
         const findElByPatterns = (patterns) => {
             for (const id of patterns) {
                 const el = document.getElementById(id);
@@ -615,12 +634,16 @@ if (ltorEl) {
         const laneInputsContainer = document.getElementById('laneInputsContainer');
 
         directions.forEach(arah => {
+            // Cek apakah arah ini yang sedang ditampilkan di UI
+            const isVisible = (currentDirShown === arah);
+
             const lanes = config[arah]?.in || 0;
             // ensure array exists
             if (!Array.isArray(laneTrafficConfig[arah])) laneTrafficConfig[arah] = [];
+            
             for (let idx = 0; idx < lanes; idx++) {
                 const laneIndex1 = idx + 1;
-                // default fallback values
+                // default fallback values (ambil dari memory saat ini)
                 let flow = laneTrafficConfig[arah][idx]?.flow || 0;
                 let motor = laneTrafficConfig[arah][idx]?.motorPct ?? 50;
                 let mobil = laneTrafficConfig[arah][idx]?.mobilPct ?? 30;
@@ -651,6 +674,18 @@ if (ltorEl) {
                     const elMobil = findElByPatterns(possibleMobilIds);
                     const elTruk = findElByPatterns(possibleTrukIds);
 
+                    // --- BUG FIX PENTING ---
+                    // Jika tab arah ini sedang TIDAK aktif (hidden), elemen DOM-nya dihapus oleh index.html.
+                    // Jangan baca nilai (karena akan null/missing) dan JANGAN fallback ke global slider.
+                    // Pertahankan nilai yang ada di memory (laneTrafficConfig).
+                    const anyElementFound = (elFlow || elMotor || elMobil || elTruk);
+                    
+                    // Jika input tidak terlihat dan TIDAK dalam mode import JSON, skip.
+                    if (!isVisible && !anyElementFound && !window.__importingJSON) {
+                        continue;
+                    }
+                    // -----------------------
+
                     if (elFlow) {
                         const v = parseFloat(elFlow.value);
                         if (!Number.isNaN(v)) flow = Math.max(0, Math.round(v));
@@ -669,66 +704,42 @@ if (ltorEl) {
                     }
 
                     // 2) Jika elemen-per-lajur tidak ada sebagai id, coba baca dari laneInputsContainer
-                    //    BUT: laneInputsContainer umumnya hanya berisi lajur untuk arah yang dipilih (currentDirShown)
-                    if ((!elFlow && !elMotor && !elMobil && !elTruk) && laneInputsContainer && currentDirShown === arah) {
-                        // ambil semua .lane-row di container — urutannya sesuai lajur 1..N
+                    if ((!elFlow && !elMotor && !elMobil && !elTruk) && laneInputsContainer && isVisible) {
                         const rows = Array.from(laneInputsContainer.querySelectorAll('.lane-row'));
                         if (rows[idx]) {
                             const row = rows[idx];
-                            // flow: number input yang bukan .ratio-input (prioritas dataset.field==='flow' kalau ada)
-                            const flowByDataset = row.querySelector('input[data-field="flow"]');
-                            const flowCandidate = flowByDataset || row.querySelector('input[type="number"]:not(.ratio-input)');
+                            // flow
+                            const flowCandidate = row.querySelector('input[data-field="flow"]') || row.querySelector('input[type="number"]:not(.ratio-input)');
                             if (flowCandidate) {
                                 const v = parseFloat(flowCandidate.value);
                                 if (!Number.isNaN(v)) flow = Math.max(0, Math.round(v));
                             }
-                            // ratio inputs: class .ratio-input OR inputs with dataset fields motorPct/carPct/truckPct
-                            let motorByDataset = row.querySelector('input[data-field="motorPct"].ratio-input') || row.querySelector('input[data-field="motorPct"]');
-                            let mobilByDataset = row.querySelector('input[data-field="carPct"].ratio-input') || row.querySelector('input[data-field="carPct"]');
-                            let trukByDataset  = row.querySelector('input[data-field="truckPct"].ratio-input') || row.querySelector('input[data-field="truckPct"]');
+                            // ratio inputs
+                            let motorByDataset = row.querySelector('input[data-field="motorPct"]');
+                            let mobilByDataset = row.querySelector('input[data-field="carPct"]');
+                            let trukByDataset  = row.querySelector('input[data-field="truckPct"]');
 
-                            // fallback: find first three .ratio-input in row
-                            const ratioInputs = row.querySelectorAll('input.ratio-input');
-                            if (!motorByDataset && ratioInputs.length >= 1) motorByDataset = ratioInputs[0];
-                            if (!mobilByDataset && ratioInputs.length >= 2) mobilByDataset = ratioInputs[1];
-                            if (!trukByDataset && ratioInputs.length >= 3) trukByDataset = ratioInputs[2];
-
-                            if (motorByDataset) {
-                                const v = parseFloat(motorByDataset.value);
-                                if (!Number.isNaN(v)) motor = v;
-                            }
-                            if (mobilByDataset) {
-                                const v = parseFloat(mobilByDataset.value);
-                                if (!Number.isNaN(v)) mobil = v;
-                            }
-                            if (trukByDataset) {
-                                const v = parseFloat(trukByDataset.value);
-                                if (!Number.isNaN(v)) truk = v;
-                            }
+                            if (motorByDataset) { const v = parseFloat(motorByDataset.value); if (!Number.isNaN(v)) motor = v; }
+                            if (mobilByDataset) { const v = parseFloat(mobilByDataset.value); if (!Number.isNaN(v)) mobil = v; }
+                            if (trukByDataset)  { const v = parseFloat(trukByDataset.value);  if (!Number.isNaN(v)) truk = v; }
                         }
                     }
 
-                    // 3) Jika tidak ada input sama sekali untuk rasio: gunakan fallback global truck slider atau configTraffic
-                    if (!elMotor && !elMobil && !elTruk) {
-                        const globalTruckSlider = document.getElementById('truckPercentageSlider') || document.getElementById('truckSlider') || null;
+                    // 3) Jika tidak ada input sama sekali (dan belum diskip logic isVisible), fallback global
+                    if (!elMotor && !elMobil && !elTruk && !isVisible) {
+                        const globalTruckSlider = document.getElementById('truckPercentageSlider');
                         if (globalTruckSlider) {
                             const tp = parseFloat(globalTruckSlider.value) || configTraffic[arah]?.truckPct || 20;
                             truk = tp;
                             const remain = Math.max(0, 100 - truk);
                             motor = Math.round(remain / 2);
                             mobil = remain - motor;
-                        } else {
-                            const tp = configTraffic[arah]?.truckPct ?? 20;
-                            truk = tp;
-                            const remain = Math.max(0, 100 - tp);
-                            motor = Math.round(remain / 2);
-                            mobil = remain - motor;
                         }
                     }
 
-                    // 4) Normalisasi bobot agar total = 100 (menggunakan normalizeThree)
+                    // 4) Normalisasi bobot agar total = 100
                     const [nm, nc, nt] = normalizeThree(motor, mobil, truk);
-                    // Set kembali ke laneTrafficConfig dengan pembulatan & safety clamp
+                    
                     const laneObj = {
                         flow: Math.max(0, Math.round(Number(flow || 0))),
                         motorPct: Math.max(0, Math.round(Number(nm || 0))),
@@ -741,18 +752,20 @@ if (ltorEl) {
 
                     laneTrafficConfig[arah][idx] = laneObj;
 
-                    console.debug(`[main] lane ${arah} #${idx+1} => flow=${laneObj.flow}, motor=${laneObj.motorPct}, mobil=${laneObj.mobilPct}, truk=${laneObj.trukPct}`);
+                    // Debug hanya jika sedang aktif
+                    if(isVisible) {
+                         console.debug(`[main] lane ${arah} #${idx+1} updated => flow=${laneObj.flow}, motor=${laneObj.motorPct}, mobil=${laneObj.mobilPct}, truk=${laneObj.trukPct}`);
+                    }
                 } catch (err) {
                     console.warn(`[main] readLaneTrafficInputs: failed to parse lane ${arah} #${idx+1}`, err);
                 }
             }
         });
 
-        // Notify vehController (kirim salinan yang berisi alias agar vehmov tak tergantung satu nama properti)
+        // Notify vehController
         try {
-            // deep clone to avoid accidental mutation by vehController
             const payload = JSON.parse(JSON.stringify(laneTrafficConfig));
-            // ensure aliases on payload as well
+            // ensure aliases on payload
             Object.keys(payload).forEach(arah => {
                 (payload[arah] || []).forEach(lane => {
                     if (lane.mobilPct !== undefined && lane.carPct === undefined) lane.carPct = lane.mobilPct;
@@ -761,10 +774,6 @@ if (ltorEl) {
             });
             if (typeof vehController?.setLaneTrafficConfig === 'function') {
                 vehController.setLaneTrafficConfig(payload);
-                console.log('[main] sent laneTrafficConfig -> vehController', payload);
-            } else {
-                // still store locally (already done above)
-                console.debug('[main] vehController.setLaneTrafficConfig not available yet; laneTrafficConfig updated locally.');
             }
         } catch (e) {
             console.warn("vehController.setLaneTrafficConfig failed:", e);
@@ -1222,10 +1231,25 @@ if (typeof vehController?.setLaneTrafficConfig === 'function') {
         vehController.scheduleNextSpawn(arah, performance.now());
     });
 
+    // ====== SIMULATION SPEED CONTROL ======
+let simSpeed = 1;
+
+const speedSlider = document.getElementById("simSpeedSlider");
+const speedLabel = document.getElementById("simSpeedVal");
+
+if (speedSlider) {
+    speedLabel.textContent = simSpeed.toFixed(1) + "×";
+    speedSlider.addEventListener("input", () => {
+        simSpeed = parseFloat(speedSlider.value);
+        speedLabel.textContent = simSpeed.toFixed(1) + "×";
+        console.log("Simulation Speed:", simSpeed);
+    });
+}
+
     // ---------- animate / loop ----------
     let lastTimestamp = performance.now();
     function animate(timestamp) {
-        const deltaTime = timestamp - lastTimestamp;
+        const deltaTime = (timestamp - lastTimestamp) * simSpeed;
         lastTimestamp = timestamp;
         // ================= TIMER UPDATE (HH:MM:SS) =================
 if (typeof simTimerStart === 'undefined') {
@@ -1367,7 +1391,18 @@ if (!realTrafficStats.startTime) realTrafficStats.startTime = Date.now();
             
                     // 4) draw vehicles
                     const vehiclesFromCtrl = vehController.getVehicles();
+                    
+                    // --- AMBIL STATUS CHECKBOX ID ---
+                    const showIdsEl = document.getElementById("debugShowIds");
+                    const showIds = showIdsEl ? showIdsEl.checked : true; 
+                    // --------------------------------
+
                     vehiclesFromCtrl.forEach(vehicle => {
+                        // --- Culling Utama: Jika di luar layar (buffer 100px), jangan gambar apapun ---
+                        if (vehicle.x < -100 || vehicle.x > canvas.width + 100 || 
+                            vehicle.y < -100 || vehicle.y > canvas.height + 100) return;
+                        // -----------------------------------------------------------------------------
+
                         vctx.save();
                         vctx.translate(vehicle.x, vehicle.y);
                         if (typeof vehicle.angle === "number") {
@@ -1377,8 +1412,12 @@ if (!realTrafficStats.startTime) realTrafficStats.startTime = Date.now();
                             else if (vehicle.direction === 'barat') vctx.rotate(Math.PI / 2);
                             else if (vehicle.direction === 'utara') vctx.rotate(Math.PI);
                         }
+                        
+                        // Gambar Sprite Mobil (Selalu, jika lolos culling)
                         drawVehicle(vctx, { x: 0, y: 0, type: vehicle.type });
-                        if (vehicle.id) {
+                        
+                        // Gambar ID (Hanya jika saklar ON)
+                        if (showIds && vehicle.id) {
                             vctx.fillStyle = "yellow";
                             vctx.font = "bold 12px Arial";
                             vctx.textAlign = "center";
@@ -1412,6 +1451,10 @@ Promise.all(loadImagePromises).then(() => {
         // Summary UI wajib dibuat dulu sebelum Exporter
         initSummary('summary-root');
         updateSummaryTable(config);
+
+        // --- TAMBAHAN: Panggil sekali saja untuk memunculkan tombol Refresh ---
+        generateSpeedTables(); 
+        // ----------------------------------------------------------------------
 
         // Setelah summary sudah ada → baru buat tombol export
         initReportExporter({
@@ -1468,7 +1511,50 @@ if (timerDiv) timerDiv.textContent = "00:00:00";
                 }
               }, 2000);
             
+              // 🔥 FORCE UPDATE semua arah setelah import berhasil
+setTimeout(() => {
+    if (typeof window.readLaneTrafficInputs === "function") {
+        window.readLaneTrafficInputs(); 
+    }
+
+    if (window.vehController && typeof window.vehController.setLaneTrafficConfig === "function") {
+        window.vehController.setLaneTrafficConfig(window.laneTrafficConfig);
+    }
+
+    console.log("🚦 Semua arus lalu lintas berhasil diperbarui dari JSON.");
+}, 500);
+
+window.updateTrafficUIFromConfig = function() {
+    const dirs = ["utara", "timur", "selatan", "barat"];
+
+    dirs.forEach(dir => {
+        if (!window.laneTrafficConfig[dir]) return;
+
+        window.laneTrafficConfig[dir].forEach(item => {
+            const { lajur, arus, motor, mobil, truk } = item;
+            
+            const mapping = [
+                [`${dir}_lane${lajur}_flow`, arus],
+                [`${dir}_lane${lajur}_motorPct`, motor],
+                [`${dir}_lane${lajur}_carPct`, mobil],
+                [`${dir}_lane${lajur}_truckPct`, truk]
+            ];
+
+            mapping.forEach(([id, val]) => {
+                const el = document.getElementById(id);
+                if (el) {
+                    el.value = val;
+                    el.dispatchEvent(new Event("change"));
+                }
+            });
+
+        });
+
+    });
+
+    console.log("🟢 UI sinkron dengan konfigurasi JSON");
+};
               console.log("✅ Reset selesai: kendaraan, lampu, dan diagram diulang dari awal.");
             }
             
-            setInterval(generateSpeedTables, 1000);
+           // setInterval(generateSpeedTables, 1000);
