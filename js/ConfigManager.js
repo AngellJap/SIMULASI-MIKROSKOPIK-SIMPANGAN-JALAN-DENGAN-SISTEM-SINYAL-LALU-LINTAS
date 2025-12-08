@@ -43,29 +43,22 @@ export function downloadKonfigurasi() {
  * Helper: Ambil data detail per lajur (Motor/Mobil/Truk)
  */
 function ambilDataLaluLintasSemuaArah() {
-    const data = {};
-    const arah = ['utara', 'timur', 'selatan', 'barat'];
-    
-    arah.forEach(dir => {
-        data[dir] = [];
-        // Kita loop asumsi maksimal 5 lajur, atau baca dari input geometri
-        const jumlahLajur = parseInt(document.getElementById(dir === 'utara' ? 'inNorth' : dir === 'timur' ? 'inEast' : dir === 'selatan' ? 'inSouth' : 'inWest').value) || 1;
+    if (!window.laneTrafficConfig) {
+        console.warn("laneTrafficConfig tidak ditemukan.");
+        return {};
+    }
 
-        for (let i = 1; i <= jumlahLajur; i++) {
-            // Pattern ID: utara_lane1_flow, utara_lane1_motorPct, dst.
-            const flow = document.getElementById(`${dir}_lane${i}_flow`);
-            
-            if (flow) { // Jika elemen ada
-                data[dir].push({
-                    lajur: i,
-                    arus: flow.value,
-                    motor: document.getElementById(`${dir}_lane${i}_motorPct`).value,
-                    mobil: document.getElementById(`${dir}_lane${i}_carPct`).value,
-                    truk: document.getElementById(`${dir}_lane${i}_truckPct`).value
-                });
-            }
-        }
+    const data = {};
+    ['utara', 'timur', 'selatan', 'barat'].forEach(dir => {
+        data[dir] = window.laneTrafficConfig[dir].map((lane, index) => ({
+            lajur: index + 1,
+            arus: lane.flow,
+            motor: lane.motorPct,
+            mobil: lane.mobilPct,
+            truk: lane.trukPct
+        }));
     });
+
     return data;
 }
 
@@ -130,8 +123,24 @@ function terapkanKonfigurasi(data) {
 
     // 3. Set Lalu Lintas (Beri sedikit jeda agar DOM input traffic selesai dibuat oleh event geometri)
     setTimeout(() => {
-        const arah = ['utara', 'timur', 'selatan', 'barat'];
-        arah.forEach(dir => {
+    const directionSelect = document.getElementById("directionSelect");
+    const dirs = ['utara', 'timur', 'selatan', 'barat'];
+
+    let delay = 0;
+
+    dirs.forEach(dir => {
+
+        // 1️⃣ buka tab agar input DOM dibuat
+        setTimeout(() => {
+            directionSelect.value = dir;
+            directionSelect.dispatchEvent(new Event('change'));
+            console.log(`UI switched to ${dir}`);
+        }, delay);
+
+        delay += 200;
+
+        // 2️⃣ isi nilai JSON ke input DOM yang sudah muncul
+        setTimeout(() => {
             if (data.lalu_lintas && data.lalu_lintas[dir]) {
                 data.lalu_lintas[dir].forEach(item => {
                     setVal(`${dir}_lane${item.lajur}_flow`, item.arus);
@@ -139,7 +148,12 @@ function terapkanKonfigurasi(data) {
                     setVal(`${dir}_lane${item.lajur}_carPct`, item.mobil);
                     setVal(`${dir}_lane${item.lajur}_truckPct`, item.truk);
                 });
+                console.log(`JSON applied to ${dir}`);
             }
-        });
-    }, 200); // Delay 200ms
+        }, delay);
+
+        delay += 200;
+    });
+
+}, 200);
 }
