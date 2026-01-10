@@ -5,115 +5,818 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SIMULASI MIKROSKOPIK SIMPANGAN</title>
   <link rel="stylesheet" href="style.css" />
+  <style>
+    /* layout fixes to avoid double scrollbars + general small styles */
+    *, *:before, *:after { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; padding: 0; overflow-y: auto; }
+    #mainWrapper { padding: 14px; min-height: 100%; }
+
+    /* lane row single-line layout (compact) */
+    .lane-row { margin:6px 0; display:flex; gap:6px; align-items:center; flex-wrap:nowrap; }
+    .lane-row label { min-width:130px; color:inherit; flex: 0 0 auto; font-size:14px; }
+    /* arus input slightly narrower */
+    .lane-row input[type="number"] { width:90px; padding:4px; flex: 0 0 auto; font-size:13px; }
+    /* ratio/bobot inputs made slimmer */
+    .lane-row .ratio-input { width:56px; padding:4px; flex: 0 0 auto; font-size:13px; text-align:center; }
+    .lane-row .ratio-group { display:flex; gap:4px; align-items:center; flex: 0 0 auto; }
+    .lane-row .ratio-explain { font-size:13px; color:inherit; margin-right:6px; white-space:nowrap; flex: 0 0 auto; opacity:0.95; }
+
+    /* helper buttons area */
+    .lane-helper-btn { margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; }
+    .lane-helper-btn button { padding:6px 10px; font-size:13px; }
+
+    .total-flow { font-weight:700; margin:8px 0; color:inherit; }
+    .percent-label { display:block; margin-bottom:4px; }
+    .note-small { font-size:12px; color:#ddd; margin-top:10px; line-height:1.3; }
+
+    /* summary table */
+    table.lane-summary { width:100%; border-collapse:collapse; text-align:center; table-layout:fixed; }
+    table.lane-summary th, table.lane-summary td { border:1px solid #999; padding:6px; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    table.lane-summary thead th { background:#333; color:#fff; }
+
+    /* allow horizontal scroll for the summary table only if needed */
+    .summary-panel { overflow-x:auto; }
+
+    /* ensure canvas area doesn't create its own scrollbar */
+    .canvas-container { max-width:100%; overflow:visible; }
+
+    /* Debug Panel Styling (New) */
+    .debug-panel { margin-top: 15px; font-family: sans-serif; color: white; }
+    .debug-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }
+    .debug-row label { cursor: pointer; }
+    /* Checkbox styling override for consistency */
+    .debug-row input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; }
+
+    /* small screens: allow wrapping */
+    @media (max-width:800px){
+      .lane-row { flex-wrap:wrap; gap:8px; }
+      .lane-row label { min-width:100%; }
+      .lane-row input { width:100%; }
+      .lane-row .ratio-explain { width:100%; }
+      .lane-row .ratio-group { width:100%; justify-content:space-between; }
+    }
+
+    button { cursor:pointer; }
+  </style>
 </head>
 <body>
-  <h1>SIMULASI MIKROSKOPIK SIMPANGAN JALAN RAYA EMPAT LENGAN</h1>
+  <div id="mainWrapper">
+    <h1>SIMULASI MIKROSKOPIK SIMPANGAN JALAN RAYA EMPAT LENGAN</h1>
 
-  <div class="controls">
-    <h2>Pengaturan Jumlah Lajur (1 - 5)</h2>
-    <div class="lane-inputs">
-      <div>
-        <label>Utara:</label>
-        Masuk <select id="inNorth"></select>
-        Keluar <select id="outNorth"></select>
-      </div>
-      <div>
-        <label>Timur:</label>
-        Masuk <select id="inEast"></select>
-        Keluar <select id="outEast"></select>
-      </div>
-      <div>
-        <label>Selatan:</label>
-        Masuk <select id="inSouth"></select>
-        Keluar <select id="outSouth"></select>
-      </div>
-      <div>
-        <label>Barat:</label>
-        Masuk <select id="inWest"></select>
-        Keluar <select id="outWest"></select>
+    <div class="controls">
+      <h2>Pengaturan Jumlah Lajur (1 - 5)</h2>
+      <div class="lane-inputs">
+        <div>
+          <label>Utara:</label>
+          Masuk <select id="inNorth"></select>
+          Keluar <select id="outNorth"></select>
+        </div>
+        <div>
+          <label>Timur:</label>
+          Masuk <select id="inEast"></select>
+          Keluar <select id="outEast"></select>
+        </div>
+        <div>
+          <label>Selatan:</label>
+          Masuk <select id="inSouth"></select>
+          Keluar <select id="outSouth"></select>
+        </div>
+        <div>
+          <label>Barat:</label>
+          Masuk <select id="inWest"></select>
+          Keluar <select id="outWest"></select>
+        </div>
       </div>
     </div>
-  </div>
-<div class="controls-container">
-  <!-- Panel Radius Minimum -->
-  <div class="panel">
-  <h2>Radius Minimum</h2>
-  <label for="customRange">Batas Ukuran dalam meter (3.28 – 11.59) :</label>
-  <input id="customRange" type="range" min="3.28" max="11.59" step="0.01" value="3.28">
-  <span id="rangeVal">3.28</span> meter
-</div>
 
-  <!-- Panel Durasi Lampu -->
-  <div class="panel lamp-panel">
-    <h2>Pengaturan Durasi Lampu (detik)</h2>
-    <label>All-Red: </label>
-    <input id="durAllRed" type="number" value="2" min="1" max="3"> detik
-    <br>
-    <label>Kuning: </label>
-    <input id="durYellow" type="number" value="3" min="3" max="5"> detik
-    <br>
-    <label>Hijau: </label>
-    <input id="durGreen" type="number" value="5" min="1"> detik
-  </div>
-</div>
+    <div class="controls-container">
+      <!-- Panel Radius Minimum -->
+      <div class="panel">
+        <h2>Radius Minimum</h2>
+        <label for="customRange">Batas Ukuran dalam meter (3.28 – 11.59) :</label>
+        <input id="customRange" type="range" min="3.28" max="11.59" step="0.01" value="3.28">
+        <span id="rangeVal">3.28</span> meter
+      </div>
 
-<!--Panel Pengaturan Lalu Lintas-->
-  <div class="panel traffic-panel">
-    <h2>Pengaturan Arus Lalu Lintas</h2>
-    <div class="row mt-3">
-      <div class="col">
-        <label for="directionSelect" class="form-label">Lengan</label>
-        <select class="form-select" id="directionSelect"></select>
+      <!-- Panel Durasi Lampu -->
+      <div class="panel lamp-panel">
+        <h2>Pengaturan Durasi Lampu (detik)</h2>
+        <label>All-Red: </label>
+        <input id="durAllRed" type="number" value="2" min="1" max="3"> detik
+        <br>
+        <label>Kuning: </label>
+        <input id="durYellow" type="number" value="3" min="3" max="5"> detik
+        <br>
+        <label>Siklus Total: </label>
+        <input id="durCycleTotal" type="number" value="60" min="1"> detik
+      </div>
+      <p id="displayGreenCalc" style="color: #fff; font-size:14px;">
+        Hijau per arah : durCycleTotal/4 - durAllRed - durYellow detik
+      </p>
+
+      <!-- Tombol model fase -->
+      <div class="model-fase-buttons">
+        <button class="fase-btn" id="fase-searah" title="Searah Jarum Jam"><img src="logo/searah.png" alt="Searah Jarum Jam"></button>
+        <button class="fase-btn" id="fase-berhadapan" title="Berhadapan"><img src="logo/berhadapan.png" alt="Berhadapan"></button>
+        <button class="fase-btn" id="fase-berseberangan" title="Bersampingan"><img src="logo/berseberangan.png" alt="Berseberangan"></button>
+      </div>
+
+      <script>
+        // perhitungan hijau (tetap)
+        const allRedInput = document.getElementById('durAllRed');
+        const yellowInput = document.getElementById('durYellow');
+        const cycleTotalInput = document.getElementById('durCycleTotal');
+        const displayElement = document.getElementById('displayGreenCalc');
+        function updateGreenTime() {
+          const allRed = Number(allRedInput.value);
+          const yellow = Number(yellowInput.value);
+          const cycleTotal = Number(cycleTotalInput.value);
+          const greenTime = (cycleTotal / 4) - allRed - yellow;
+          displayElement.textContent = `Hijau per arah : ${greenTime} detik`;
+        }
+        allRedInput.addEventListener('input', updateGreenTime);
+        yellowInput.addEventListener('input', updateGreenTime);
+        cycleTotalInput.addEventListener('input', updateGreenTime);
+        updateGreenTime();
+      </script>
+
+      <!-- Panel Pengaturan Lalu Lintas -->
+      <div class="panel traffic-panel">
+        <h2>Pengaturan Arus Lalu Lintas</h2>
+
+        <div class="row mt-3">
+          <div class="col">
+            <label for="directionSelect" class="form-label">Pilih Arah</label>
+            <select class="form-select" id="directionSelect">
               <option value="utara">Utara</option>
               <option value="timur">Timur</option>
               <option value="selatan">Selatan</option>
               <option value="barat">Barat</option>
-        </select>
+            </select>
+          </div>
+        </div>
+
+        <!-- REVISI: Wadah input dipisah per arah agar selalu ada di DOM -->
+        <div id="laneInputsWrapper" style="margin-top:8px;">
+            <div id="laneInputs-utara"></div>
+            <div id="laneInputs-timur" style="display:none;"></div>
+            <div id="laneInputs-selatan" style="display:none;"></div>
+            <div id="laneInputs-barat" style="display:none;"></div>
+        </div>
+
+        <!-- helper buttons (dipisah arus/bobot + reset arus/bobot) -->
+        <div class="lane-helper-btn" id="laneHelperButtons" style="margin-top:8px;"></div>
+
+        <!-- tampilkan total per arah (hasil agregat dari tiap lajur) -->
+        <div class="total-flow" id="totalFlowText">Total Arus (semua lajur): - smp/jam</div>
+
+        <!-- Keterangan singkat user-friendly di bawah -->
+        <p class="note-small">
+          <strong>Catatan:</strong> Tiap baris menampilkan <em>Lajur N (smp/jam)</em>, diikuti keterangan <strong>Bobot — motor | mobil | truk</strong> dalam satu baris. Tiga kotak input bobot berada di sampingnya. Nilai bobot akan otomatis dinormalisasi ke 100% per lajur sebelum digunakan dalam perhitungan.
+        </p>
       </div>
     </div>
-    <div class="row mt-3">
-       <div class="col">
-           <label for="trafficFlowSlider" class="form-label">
-               Arus Lalu Lintas: <span id="flowValue">500 smp/jam</span>
-           </label>
-           <input type="range" class="form-range" id="trafficFlowSlider" min="100" max="1000" step="100" value="500">
-       </div>
-     </div>
-        <div class="row mt-3">
-            <div class="col">
-                <label for="truckPercentageSlider" class="form-label">
-                    Persentase Truk: <span id="truckPercentageValue">20%</span>
-                </label>
-                <input type="range" class="form-range" id="truckPercentageSlider" min="0" max="100" step="1" value="20">
-            </div>
-        </div>
+
+    <!-- ====== TABEL RINGKASAN ARUS LALU LINTAS (PER-LAJUR) ====== -->
+    <div class="panel summary-panel">
+      <h3>Ringkasan Pengaturan Arus Lalu Lintas (Per-lajur)</h3>
+
+      <table class="lane-summary" id="tabelRingkasan">
+        <thead>
+          <tr>
+            <th rowspan="2">Arah</th>
+            <th rowspan="2">Lajur</th>
+            <th rowspan="2">Arus lalu lintas</th>
+            <th colspan="3">Bobot</th>
+            <th colspan="3">(SMP)</th>
+          </tr>
+          <tr>
+            <th>motor</th>
+            <th>mobil</th>
+            <th>truk</th>
+            <th>motor</th>
+            <th>mobil</th>
+            <th>truk</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- Utara -->
+          <tr><td rowspan="5">Utara</td><td>1</td><td id="arus-utara-1">-</td><td id="motorpct-utara-1">-</td><td id="carpct-utara-1">-</td><td id="trukpct-utara-1">-</td><td id="motorn-utara-1">-</td><td id="carn-utara-1">-</td><td id="trukn-utara-1">-</td></tr>
+          <tr><td>2</td><td id="arus-utara-2">-</td><td id="motorpct-utara-2">-</td><td id="carpct-utara-2">-</td><td id="trukpct-utara-2">-</td><td id="motorn-utara-2">-</td><td id="carn-utara-2">-</td><td id="trukn-utara-2">-</td></tr>
+          <tr><td>3</td><td id="arus-utara-3">-</td><td id="motorpct-utara-3">-</td><td id="carpct-utara-3">-</td><td id="trukpct-utara-3">-</td><td id="motorn-utara-3">-</td><td id="carn-utara-3">-</td><td id="trukn-utara-3">-</td></tr>
+          <tr><td>4</td><td id="arus-utara-4">-</td><td id="motorpct-utara-4">-</td><td id="carpct-utara-4">-</td><td id="trukpct-utara-4">-</td><td id="motorn-utara-4">-</td><td id="carn-utara-4">-</td><td id="trukn-utara-4">-</td></tr>
+          <tr><td>5</td><td id="arus-utara-5">-</td><td id="motorpct-utara-5">-</td><td id="carpct-utara-5">-</td><td id="trukpct-utara-5">-</td><td id="motorn-utara-5">-</td><td id="carn-utara-5">-</td><td id="trukn-utara-5">-</td></tr>
+
+          <!-- Timur -->
+          <tr><td rowspan="5">Timur</td><td>1</td><td id="arus-timur-1">-</td><td id="motorpct-timur-1">-</td><td id="carpct-timur-1">-</td><td id="trukpct-timur-1">-</td><td id="motorn-timur-1">-</td><td id="carn-timur-1">-</td><td id="trukn-timur-1">-</td></tr>
+          <tr><td>2</td><td id="arus-timur-2">-</td><td id="motorpct-timur-2">-</td><td id="carpct-timur-2">-</td><td id="trukpct-timur-2">-</td><td id="motorn-timur-2">-</td><td id="carn-timur-2">-</td><td id="trukn-timur-2">-</td></tr>
+          <tr><td>3</td><td id="arus-timur-3">-</td><td id="motorpct-timur-3">-</td><td id="carpct-timur-3">-</td><td id="trukpct-timur-3">-</td><td id="motorn-timur-3">-</td><td id="carn-timur-3">-</td><td id="trukn-timur-3">-</td></tr>
+          <tr><td>4</td><td id="arus-timur-4">-</td><td id="motorpct-timur-4">-</td><td id="carpct-timur-4">-</td><td id="trukpct-timur-4">-</td><td id="motorn-timur-4">-</td><td id="carn-timur-4">-</td><td id="trukn-timur-4">-</td></tr>
+          <tr><td>5</td><td id="arus-timur-5">-</td><td id="motorpct-timur-5">-</td><td id="carpct-timur-5">-</td><td id="trukpct-timur-5">-</td><td id="motorn-timur-5">-</td><td id="carn-timur-5">-</td><td id="trukn-timur-5">-</td></tr>
+
+          <!-- Selatan -->
+          <tr><td rowspan="5">Selatan</td><td>1</td><td id="arus-selatan-1">-</td><td id="motorpct-selatan-1">-</td><td id="carpct-selatan-1">-</td><td id="trukpct-selatan-1">-</td><td id="motorn-selatan-1">-</td><td id="carn-selatan-1">-</td><td id="trukn-selatan-1">-</td></tr>
+          <tr><td>2</td><td id="arus-selatan-2">-</td><td id="motorpct-selatan-2">-</td><td id="carpct-selatan-2">-</td><td id="trukpct-selatan-2">-</td><td id="motorn-selatan-2">-</td><td id="carn-selatan-2">-</td><td id="trukn-selatan-2">-</td></tr>
+          <tr><td>3</td><td id="arus-selatan-3">-</td><td id="motorpct-selatan-3">-</td><td id="carpct-selatan-3">-</td><td id="trukpct-selatan-3">-</td><td id="motorn-selatan-3">-</td><td id="carn-selatan-3">-</td><td id="trukn-selatan-3">-</td></tr>
+          <tr><td>4</td><td id="arus-selatan-4">-</td><td id="motorpct-selatan-4">-</td><td id="carpct-selatan-4">-</td><td id="trukpct-selatan-4">-</td><td id="motorn-selatan-4">-</td><td id="carn-selatan-4">-</td><td id="trukn-selatan-4">-</td></tr>
+          <tr><td>5</td><td id="arus-selatan-5">-</td><td id="motorpct-selatan-5">-</td><td id="carpct-selatan-5">-</td><td id="trukpct-selatan-5">-</td><td id="motorn-selatan-5">-</td><td id="carn-selatan-5">-</td><td id="trukn-selatan-5">-</td></tr>
+
+          <!-- Barat -->
+          <tr><td rowspan="5">Barat</td><td>1</td><td id="arus-barat-1">-</td><td id="motorpct-barat-1">-</td><td id="carpct-barat-1">-</td><td id="trukpct-barat-1">-</td><td id="motorn-barat-1">-</td><td id="carn-barat-1">-</td><td id="trukn-barat-1">-</td></tr>
+          <tr><td>2</td><td id="arus-barat-2">-</td><td id="motorpct-barat-2">-</td><td id="carpct-barat-2">-</td><td id="trukpct-barat-2">-</td><td id="motorn-barat-2">-</td><td id="carn-barat-2">-</td><td id="trukn-barat-2">-</td></tr>
+          <tr><td>3</td><td id="arus-barat-3">-</td><td id="motorpct-barat-3">-</td><td id="carpct-barat-3">-</td><td id="trukpct-barat-3">-</td><td id="motorn-barat-3">-</td><td id="carn-barat-3">-</td><td id="trukn-barat-3">-</td></tr>
+          <tr><td>4</td><td id="arus-barat-4">-</td><td id="motorpct-barat-4">-</td><td id="carpct-barat-4">-</td><td id="trukpct-barat-4">-</td><td id="motorn-barat-4">-</td><td id="carn-barat-4">-</td><td id="trukn-barat-4">-</td></tr>
+          <tr><td>5</td><td id="arus-barat-5">-</td><td id="motorpct-barat-5">-</td><td id="carpct-barat-5">-</td><td id="trukpct-barat-5">-</td><td id="motorn-barat-5">-</td><td id="carn-barat-5">-</td><td id="trukn-barat-5">-</td></tr>
+        </tbody>
+      </table>
     </div>
-  </div>
+
+    <!-- kecil: tampilkan nilai range custom -->
+    <script>
+      const slider = document.getElementById("customRange");
+      const output = document.getElementById("rangeVal");
+      function updRange(){ if(slider && output) output.textContent = slider.value; }
+      if(slider) slider.addEventListener('input', updRange);
+      updRange();
+    </script>
+
+    <!-- container canvas dan sisanya (tidak diubah) -->
+    <div style="display:flex; gap:20px; align-items:flex-start;">
+      <div class="canvas-container">
+        <canvas id="simCanvas" width="800" height="800"></canvas>
+        <canvas id="vehicleCanvas" width="800" height="800"></canvas>
+        <button id="resetBtn" class="reset-btn" title="Reset Kendaraan">⟳</button>
+        <div class="cycle-container">
+          <canvas id="cycleCanvas" width="520" height="450"></canvas>
+        </div>
+      </div>
+    </div>
+    <div class="config-manager" style="margin-bottom: 15px; padding: 10px; border: 1px dashed #666; border-radius: 5px;">
+    <h4 style="margin-top:0; color: #fff;">Manajemen Skenario</h4>
+    
+    <button id="btnExportJson" style="background-color: #fff; color:black; padding: 6px 10px; border: none; cursor: pointer;">
+        💾 Download Input (JSON)
+    </button>
+
+    <div style="margin-top: 10px;">
+        <label for="inputImportJson" style="font-size: 12px; color: #ccc;">Muat Skenario:</label>
+        <input type="file" id="inputImportJson" accept=".json" style="color: white;">
+    </div>
+</div>
+    <!-- TABEL SUMMARY DITAMBAHKAN DI SINI (TIDAK MENGGANGGU YANG ADA) -->
+<div id="summary-root" style="margin-top:20px;"></div>
+
+    <style>
+      .reset-btn {
+        position: absolute;
+        bottom: 20px;
+        left: 20px;
+        width: 60px;
+        height: 60px;
+        border-radius: 50%;
+        background-color: red;
+        border: 3px solid #888;
+        color: white;
+        font-size: 28px;
+        font-weight: bold;
+        cursor: pointer;
+        box-shadow: 0 0 6px rgba(0,0,0,0.3);
+        z-index: 9999;
+        transition: all 0.2s ease;
+      }
+      .reset-btn:hover { background-color: darkred; transform: scale(1.05); }
+    </style>
+
+    <!-- LEFT PANEL (tidak diubah) -->
+    <div class="panel left-turn-panel">
+      <style>
+        /* existing left-panel styles kept unchanged */
+        .switch{ position: relative; display:inline-block; width:70px; height:34px; }
+        .switch input{ opacity:0; width:0; height:0; }
+        .slider{ position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#888; transition:.4s; border-radius:34px;}
+        .slider:before{ position:absolute; content:""; height:26px; width:26px; left:4px; bottom:4px; background-color:white; transition:.4s; border-radius:50%;}
+        input:checked + .slider { background-color:#2ecc71; box-shadow:0 0 10px rgba(46,204,113,0.6); }
+        input:checked + .slider:before { transform:translateX(36px); }
+
+        .left-turn-panel { position:absolute; left:70px; top:650px; padding:10px 20px; border-radius:10px; color:white; background-color:transparent;}
+        .left-turn-panel h2, .left-turn-panel h3 { margin:10px 0 5px; font-size:16px; color:#fff; font-weight:bold; }
+        .model-fase-container { display:flex; flex-wrap:wrap; gap:32px; margin:8px 0 14px; }
+        .fase-btn { width:36px; height:36px; border-radius:50%; background-color:#444; color:white; font-weight:bold; border:2px solid #777; cursor:pointer; transition:all .2s;}
+        .fase-btn:hover { background-color:#2ecc71; }
+        .fase-btn.active { border:3px solid white; box-shadow:0 0 10px rgba(255,255,255,0.7); }
+        .merging-container { display:flex; align-items:center; gap:10px; margin-top:10px; }
+        .simspeed-panel { font-family:sans-serif; margin-top:12px; color:white; }
+        #simSpeedSlider { width:100%; }
+      </style>
+
+      <h2>Belok Kiri Langsung (LTOR)</h2>
+      <div class="ltsor-container">
+        <span style="font-weight:bold;color:#fff;">NLTOR</span>
+        <label class="switch">
+          <input type="checkbox" id="ltsorGlobalSwitch"><span class="slider round"></span>
+        </label>
+        <span style="font-weight:bold;color:#fff;">LTOR</span>
+      </div>
+
+      <div class="panel simspeed-panel">
+        <h3>Kecepatan Simulasi</h3>
+        <label for="simSpeedSlider">Kecepatan: <span id="simSpeedVal">1.0×</span></label>
+        <input type="range" id="simSpeedSlider" min="0.25" max="3.0" step="0.25" value="1.0" />
+      </div>
+
+      <!-- ======= PANEL BARU: DEBUG CONTROLS ======= -->
+      <div class="panel debug-panel">
+        <h3>Pengaturan Visual (Debug)</h3>
+        
+        <div class="debug-row">
+          <label for="debugShowIds">Tampilkan ID Kendaraan</label>
+          <input type="checkbox" id="debugShowIds" checked>
+        </div>
+
+        <div class="debug-row">
+          <label for="debugShowPaths">Tampilkan Jalur Lintasan</label>
+          <input type="checkbox" id="debugShowPaths" checked>
+        </div>
+
+        <div class="debug-row">
+          <label for="debugShowHitbox">Tampilkan Hitbox & Laser</label>
+          <input type="checkbox" id="debugShowHitbox" checked>
+        </div>
+
+        <div class="debug-row">
+          <label for="debugShowPoints">Tampilkan Titik Debug</label>
+          <input type="checkbox" id="debugShowPoints" checked>
+        </div>
+      </div>
+      <!-- ========================================== -->
+
+    </div>
+
+    <!-- muat main.js (tidak diganggu) -->
+    <script type="module" src="js/main.js"></script>
+
+    <!-- ====== SCRIPT DINAMIS PENGATURAN LAJUR & NORMALISASI BOBOT (REVISI: 4 CONTAINER) ====== -->
+    <script>
+      // data per arah: setiap lanes[] berisi objek { flow, motorPct, carPct, truckPct }
+      const dataArah = {
+        utara:  { arus:0, lanes:[] },
+        timur:  { arus:0, lanes:[] },
+        selatan:{ arus:0, lanes:[] },
+        barat:  { arus:0, lanes:[] }
+      };
+
+      // refs
+      const arahSelect = document.getElementById('directionSelect');
+      const totalFlowText = document.getElementById('totalFlowText');
+      const helperArea = document.getElementById('laneHelperButtons');
+      // Perhatikan: kita tidak lagi menggunakan single laneInputsContainer, tapi pembungkusnya
+      const laneInputsWrapper = document.getElementById('laneInputsWrapper');
+
+      // Helper: dispatch input/change events on lane inputs so external listeners (main.js / controller) detect programmatic changes
+      function dispatchLaneInputsEvent(){
+        if(!laneInputsWrapper) return;
+        const elems = laneInputsWrapper.querySelectorAll('input, select');
+        elems.forEach(el => {
+          try {
+            // dispatch input first (user-like)
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            // also dispatch change for selects or when needed
+            if(el.tagName.toLowerCase() === 'select') {
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          } catch(e){
+            // ignore; best-effort
+          }
+        });
+        // Broadcast a custom event in microtask so listeners (MutationObserver / attachers) have time to attach.
+        setTimeout(() => {
+          try {
+            document.dispatchEvent(new CustomEvent('laneInputsUpdated', {
+              detail: {
+                ts: Date.now(),
+                // include a snapshot of dataArah to help consumers that prefer direct payload
+                snapshot: JSON.parse(JSON.stringify(dataArah))
+              }
+            }));
+          } catch(e){}
+        }, 0);
+        // debug
+        console.log('[lane] dispatched input/change events for', elems.length, 'elements');
+      }
+
+      // populate in/out selects default 1..5 jika kosong
+      ['inNorth','outNorth','inEast','outEast','inSouth','outSouth','inWest','outWest'].forEach(id=>{
+        const el = document.getElementById(id);
+        if(el && el.options.length === 0){
+          for(let i=1;i<=5;i++){ const o=document.createElement('option'); o.value=i; o.text=i; el.appendChild(o); }
+          el.value = 2;
+        }
+      });
+
+      function inSelectIdFor(dir){
+        return (dir === 'utara') ? 'inNorth' : (dir === 'timur') ? 'inEast' : (dir === 'selatan') ? 'inSouth' : 'inWest';
+      }
+      function dirForInId(id){
+        if(id === 'inNorth') return 'utara';
+        if(id === 'inEast') return 'timur';
+        if(id === 'inSouth') return 'selatan';
+        if(id === 'inWest') return 'barat';
+        return null;
+      }
+
+      // -------------------------
+      // Normalization helper
+      // -------------------------
+      function normalizeThree(a,b,c){
+        const raw = [Number(a)||0, Number(b)||0, Number(c)||0];
+        const sum = raw[0]+raw[1]+raw[2];
+        if(sum === 0){
+          return [33,33,34];
+        }
+        const floats = raw.map(v => (v / sum) * 100);
+        const floors = floats.map(f => Math.floor(f));
+        let rem = 100 - (floors[0] + floors[1] + floors[2]);
+        const fracs = floats.map((f,i)=>({i, frac: f - floors[i]}));
+        fracs.sort((x,y)=> y.frac - x.frac);
+        const result = floors.slice();
+        for(let k=0;k<rem;k++){
+          result[fracs[k].i] += 1;
+        }
+        return result;
+      }
+
+      // create default lane object
+      function makeLane(flow = 250, m = 40, c = 40, t = 20){
+        return { flow: Number(flow) || 0, motorPct: Number(m) || 0, carPct: Number(c) || 0, truckPct: Number(t) || 0 };
+      }
+
+      // RENDER lanes: render into SPECIFIC container for that direction
+      function renderLanesForDirection(dir){
+        const selId = inSelectIdFor(dir);
+        const sel = document.getElementById(selId);
+        const count = Math.max(1, parseInt(sel?.value || 2));
+        const cfg = dataArah[dir];
+
+        // Ensure cfg lanes array size matches count
+        while(cfg.lanes.length < count) cfg.lanes.push(makeLane());
+        if(cfg.lanes.length > count) cfg.lanes = cfg.lanes.slice(0, count);
+
+        // Target the specific container for this direction
+        const specificContainer = document.getElementById(`laneInputs-${dir}`);
+        if(!specificContainer) return;
+        
+        specificContainer.innerHTML = '';
+
+        for(let i=0;i<count;i++){
+          const lane = cfg.lanes[i];
+          const row = document.createElement('div');
+          row.className = 'lane-row';
+          row.dataset.dir = dir;     // mark row with direction
+          row.dataset.laneIdx = i;
+
+          const label = document.createElement('label');
+          label.textContent = `Lajur ${i+1} (smp/jam):`;
+          row.appendChild(label);
+
+          // flow input
+          const inpFlow = document.createElement('input');
+          inpFlow.type = 'number';
+          inpFlow.min = 0;
+          inpFlow.step = 10;
+          inpFlow.value = lane.flow;
+          inpFlow.dataset.idx = i;
+          inpFlow.dataset.field = 'flow';
+          inpFlow.dataset.dir = dir;                          // mark input with direction
+          inpFlow.id = `${dir}_lane${i+1}_flow`;              // ID tetap sama agar ConfigManager terbaca
+          inpFlow.addEventListener('input', (e)=>{
+            const idx = parseInt(e.target.dataset.idx);
+            const val = parseInt(e.target.value) || 0;
+            cfg.lanes[idx].flow = val;
+            updateTotalsForDirection(dir);
+            // allow event to bubble naturally
+          });
+          row.appendChild(inpFlow);
+
+          // EXPLANATION text before bobot inputs
+          const explain = document.createElement('div');
+          explain.className = 'ratio-explain';
+          explain.textContent = 'Bobot — motor | mobil | truk';
+          row.appendChild(explain);
+
+          // bobot group (motor, car, truck)
+          const rgroup = document.createElement('div');
+          rgroup.className = 'ratio-group';
+
+          // motor bobot
+          const inpMotor = document.createElement('input');
+          inpMotor.type = 'number';
+          inpMotor.min = 0;
+          inpMotor.max = 1000;
+          inpMotor.step = 1;
+          inpMotor.className = 'ratio-input';
+          inpMotor.value = lane.motorPct;
+          inpMotor.title = 'Bobot Motor (angka relatif; akan dinormalisasi)';
+          inpMotor.dataset.idx = i;
+          inpMotor.dataset.field = 'motorPct';
+          inpMotor.dataset.dir = dir;
+          inpMotor.id = `${dir}_lane${i+1}_motorPct`;
+          inpMotor.addEventListener('input', (e)=>{
+            const idx = parseInt(e.target.dataset.idx);
+            const val = parseInt(e.target.value) || 0;
+            cfg.lanes[idx].motorPct = val;
+            updateTotalsForDirection(dir);
+          });
+          rgroup.appendChild(inpMotor);
+
+          // car bobot
+          const inpCar = document.createElement('input');
+          inpCar.type = 'number';
+          inpCar.min = 0;
+          inpCar.max = 1000;
+          inpCar.step = 1;
+          inpCar.className = 'ratio-input';
+          inpCar.value = lane.carPct;
+          inpCar.title = 'Bobot Mobil';
+          inpCar.dataset.idx = i;
+          inpCar.dataset.field = 'carPct';
+          inpCar.dataset.dir = dir;
+          inpCar.id = `${dir}_lane${i+1}_carPct`;
+          inpCar.addEventListener('input', (e)=>{
+            const idx = parseInt(e.target.dataset.idx);
+            const val = parseInt(e.target.value) || 0;
+            cfg.lanes[idx].carPct = val;
+            updateTotalsForDirection(dir);
+          });
+          rgroup.appendChild(inpCar);
+
+          // truck bobot
+          const inpTruck = document.createElement('input');
+          inpTruck.type = 'number';
+          inpTruck.min = 0;
+          inpTruck.max = 1000;
+          inpTruck.step = 1;
+          inpTruck.className = 'ratio-input';
+          inpTruck.value = lane.truckPct;
+          inpTruck.title = 'Bobot Truk';
+          inpTruck.dataset.idx = i;
+          inpTruck.dataset.field = 'truckPct';
+          inpTruck.dataset.dir = dir;
+          inpTruck.id = `${dir}_lane${i+1}_truckPct`;
+          inpTruck.addEventListener('input', (e)=>{
+            const idx = parseInt(e.target.dataset.idx);
+            const val = parseInt(e.target.value) || 0;
+            cfg.lanes[idx].truckPct = val;
+            updateTotalsForDirection(dir);
+          });
+          rgroup.appendChild(inpTruck);
+
+          row.appendChild(rgroup);
+          specificContainer.appendChild(row);
+        }
+
+        updateTotalsForDirection(dir);
+        
+        // Dispatch event hanya jika kita sedang dalam mode "update all at startup" atau arah ini sedang aktif
+        // Tapi demi keamanan ConfigManager, kita dispatch global saja setiap kali render.
+        dispatchLaneInputsEvent();
+      }
+
+      // REVISI: Helper Buttons dipisah karena container sekarang ada 4.
+      // Kita buat ulang helper buttons setiap kali ganti tab arah agar tombolnya memanipulasi arah yang benar.
+      function renderHelperButtonsFor(dir) {
+        helperArea.innerHTML = '';
+        const cfg = dataArah[dir];
+
+        // Isi sama arus
+        const btnFillFlow = document.createElement('button');
+        btnFillFlow.type = 'button';
+        btnFillFlow.textContent = 'Isi sama arus tiap lajur';
+        btnFillFlow.addEventListener('click', ()=>{
+          const v = parseInt(prompt('Masukkan nilai smp/jam untuk tiap lajur:', '200')) || 0;
+          for(let k=0;k<cfg.lanes.length;k++) cfg.lanes[k].flow = v;
+          renderLanesForDirection(dir); // Re-render inputs to reflect value
+          updateTotalsForDirection(dir);
+          dispatchLaneInputsEvent();
+        });
+        helperArea.appendChild(btnFillFlow);
+
+        // Isi sama bobot
+        const btnFillRatio = document.createElement('button');
+        btnFillRatio.type = 'button';
+        btnFillRatio.textContent = 'Isi sama bobot tiap lajur';
+        btnFillRatio.addEventListener('click', ()=>{
+          const vRatio = prompt('Masukkan bobot motor,mobil,truk dipisah koma (contoh:50,30,20):', '50,30,20');
+          let m=50,c=30,t=20;
+          if(vRatio){
+            const parts = vRatio.split(',').map(s=>parseInt(s.trim())||0);
+            if(parts.length>=3){ m=parts[0]; c=parts[1]; t=parts[2]; }
+          }
+          for(let k=0;k<cfg.lanes.length;k++){
+            cfg.lanes[k].motorPct = m;
+            cfg.lanes[k].carPct = c;
+            cfg.lanes[k].truckPct = t;
+          }
+          renderLanesForDirection(dir);
+          updateTotalsForDirection(dir);
+          dispatchLaneInputsEvent();
+        });
+        helperArea.appendChild(btnFillRatio);
+
+        // Reset arus
+        const btnResetFlow = document.createElement('button');
+        btnResetFlow.type = 'button';
+        btnResetFlow.textContent = 'Reset arus';
+        btnResetFlow.addEventListener('click', ()=>{
+          for(let k=0;k<cfg.lanes.length;k++) cfg.lanes[k].flow = 0;
+          renderLanesForDirection(dir);
+          updateTotalsForDirection(dir);
+          dispatchLaneInputsEvent();
+        });
+        helperArea.appendChild(btnResetFlow);
+
+        // Reset bobot
+        const btnResetRatio = document.createElement('button');
+        btnResetRatio.type = 'button';
+        btnResetRatio.textContent = 'Reset bobot';
+        btnResetRatio.addEventListener('click', ()=>{
+          for(let k=0;k<cfg.lanes.length;k++){
+            cfg.lanes[k].motorPct = 50;
+            cfg.lanes[k].carPct = 30;
+            cfg.lanes[k].truckPct = 20;
+          }
+          renderLanesForDirection(dir);
+          updateTotalsForDirection(dir);
+          dispatchLaneInputsEvent();
+        });
+        helperArea.appendChild(btnResetRatio);
+      }
+
+      // update total dan ringkasan
+      function updateTotalsForDirection(dir){
+        const cfg = dataArah[dir];
+        const total = cfg.lanes.reduce((a,b)=>a + (Number(b.flow)||0), 0);
+        cfg.arus = total;
+        
+        // Hanya update teks total jika arah ini yang sedang aktif dilihat user
+        if (arahSelect.value === dir) {
+            if(totalFlowText) totalFlowText.textContent = `Total Arus (semua lajur): ${total} smp/jam`;
+        }
+        updateSummaryTable();
+      }
+
+      // update table: per-lajur normalisasi bobot dan SMP per tipe
+      function updateSummaryTable(){
+        function setCell(id, val){
+          const el = document.getElementById(id);
+          if(!el) return;
+          el.textContent = (val !== null && val !== undefined) ? val : '-';
+        }
+        const directions = ['utara','timur','selatan','barat'];
+        directions.forEach(dir => {
+          const cfg = dataArah[dir];
+          for(let laneIdx = 0; laneIdx < 5; laneIdx++){
+            const rowNum = laneIdx + 1;
+            const arusId = `arus-${dir}-${rowNum}`;
+            const motorPctId = `motorpct-${dir}-${rowNum}`;
+            const carPctId = `carpct-${dir}-${rowNum}`;
+            const truckPctId = `trukpct-${dir}-${rowNum}`;
+            const motornId = `motorn-${dir}-${rowNum}`;
+            const carnId = `carn-${dir}-${rowNum}`;
+            const truknId = `trukn-${dir}-${rowNum}`;
+
+            const lane = cfg.lanes[laneIdx];
+
+            if(!lane){
+              setCell(arusId, '-'); setCell(motorPctId, '-'); setCell(carPctId, '-'); setCell(truckPctId, '-');
+              setCell(motornId, '-'); setCell(carnId, '-'); setCell(truknId, '-');
+            } else {
+              const flow = Number(lane.flow) || 0;
+              const [lm, lc, lt] = normalizeThree(lane.motorPct, lane.carPct, lane.truckPct);
+              const mCount = Math.round(flow * lm / 100);
+              const cCount = Math.round(flow * lc / 100);
+              const tCount = Math.round(flow * lt / 100);
+
+              setCell(arusId, flow || 0);
+              setCell(motorPctId, lm + '%');
+              setCell(carPctId, lc + '%');
+              setCell(truckPctId, lt + '%');
+              setCell(motornId, mCount || 0);
+              setCell(carnId, cCount || 0);
+              setCell(truknId, tCount || 0);
+            }
+          }
+        });
+      }
+
+      // REVISI: Logic Pindah Tab Arah (Hanya Show/Hide, tidak hapus data)
+      arahSelect.addEventListener('change', ()=>{
+        const selectedDir = arahSelect.value;
+        const allDirs = ['utara', 'timur', 'selatan', 'barat'];
+
+        allDirs.forEach(d => {
+            const container = document.getElementById(`laneInputs-${d}`);
+            if(container) {
+                container.style.display = (d === selectedDir) ? 'block' : 'none';
+            }
+        });
+
+        // Update helper buttons sesuai arah aktif
+        renderHelperButtonsFor(selectedDir);
+        
+        // Update teks total flow untuk arah aktif
+        updateTotalsForDirection(selectedDir);
+      });
+
+      // When any inSelect changes (Lane Count changes), update lanes array for that direction and re-render ONLY that direction
+      ['inNorth','inEast','inSouth','inWest'].forEach(id=>{
+        const el = document.getElementById(id);
+        if(el) el.addEventListener('change', ()=>{
+          const dir = dirForInId(id);
+          const newCount = Math.max(1, parseInt(el.value || 2));
+          const cfg = dataArah[dir];
+          
+          while(cfg.lanes.length < newCount) cfg.lanes.push(makeLane());
+          if(cfg.lanes.length > newCount) cfg.lanes = cfg.lanes.slice(0, newCount);
+          
+          // Render ulang input HANYA untuk arah yang jumlah lajurnya berubah
+          renderLanesForDirection(dir);
+          
+          updateSummaryTable();
+          dispatchLaneInputsEvent();
+        });
+      });
+
+      // INIT: Render SEMUA arah di awal (agar input DOM terbentuk untuk ConfigManager)
+      (function init(){
+        ['utara','timur','selatan','barat'].forEach(dir=>{
+          const sel = document.getElementById(inSelectIdFor(dir));
+          const defaultCount = Math.max(1, parseInt(sel?.value || 2));
+          if(dataArah[dir].lanes.length === 0){
+            for(let i=0;i<defaultCount;i++) dataArah[dir].lanes.push(makeLane());
+          }
+          // PENTING: Render semua container saat start
+          renderLanesForDirection(dir);
+        });
+
+        // Trigger change untuk set tampilan awal (misal Utara)
+        if(arahSelect) arahSelect.dispatchEvent(new Event('change'));
+        updateSummaryTable();
+      })();
+    </script>
   
-<script>
-  // tampilkan nilai slider saat digeser
-  const slider = document.getElementById("customRange");
-  const output = document.getElementById("rangeVal");
-  const update = () => output.textContent = slider.value;
-  slider.addEventListener("input", update);
-  update(); // inisialisasi nilai awal
-</script>
+<div id="speed-table-container"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<button id="btnDownloadZip">Download Semua Speed CSV (ZIP)</button>
 
-<style>
-  .panel { font-family: sans-serif; max-width: 420px }
-  input[type="range"] { width: 100% }
-</style>
 
-  <!--Container untuk 2 canvas (layer)-->  
-<div class="canvas-container">
-  <canvas id="simCanvas" width="800" height="800"></canvas>
-  <canvas id="vehicleCanvas" width="800" height="800"></canvas>
+    <!-- efek LTOR (tetap) -->
+    <script>
+      const ltsorSwitch = document.getElementById("ltsorGlobalSwitch");
+      if (ltsorSwitch) {
+        ltsorSwitch.addEventListener("change", () => {
+          const panel = document.querySelector(".left-turn-panel");
+          if (ltsorSwitch.checked) {
+            panel.style.boxShadow = "0 0 15px rgba(46,204,113,0.9)";
+            panel.style.backgroundColor = "transparent";
+          } else {
+            panel.style.boxShadow = "0 0 8px rgba(0,0,0,0.5)";
+            panel.style.backgroundColor = "#222";
+          }
+        });
+      }
+    </script>
+
+    <!-- tombol fase (tetap) -->
+    <script>
+      const faseButtons = document.querySelectorAll(".fase-btn");
+      faseButtons.forEach(button => {
+        button.addEventListener("click", () => {
+          faseButtons.forEach(btn => btn.classList.remove("active"));
+          button.classList.add("active");
+        });
+      });
+    </script>
+
+    <style>
+      .simspeed-panel { font-family: sans-serif; max-width: 420px; margin-top: 10px; }
+      #simSpeedSlider { width: 100%; }
+    </style>
+
+  </div> <!-- akhir mainWrapper -->
+  <div id="sim-timer"
+     style="
+        position: absolute;
+        top: 10px; 
+        left: 10px; 
+        color: white; 
+        font-size: 20px; 
+        font-family: Arial, sans-serif;
+        z-index: 10000;">
+    00:00:00
 </div>
 
-  <script type="module" src="js/main.js"></script>
+<!-- taruh ini di <head> atau sebelum script modul export -->
+<script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+
 </body>
 </html>
-
-
-
-
