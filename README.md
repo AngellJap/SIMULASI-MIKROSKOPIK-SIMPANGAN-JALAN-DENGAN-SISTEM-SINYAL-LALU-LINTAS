@@ -85,8 +85,3 @@ SIMULASI-MIKROSKOPIK-SIMPANGAN-JALAN-DENGAN-SISTEM-SINYAL-LALU-LINTAS/
 
 * Pastikan seluruh file JavaScript berada di dalam folder `js/` sesuai struktur asli.
 * Jangan membuka `index.html` langsung tanpa Live Server, karena beberapa fungsi (rendering dan ekspor data) dapat berjalan tidak optimal.
-
----
-
-Kalau ini dibaca penguji, mereka akan mengangguk pelan dan lanjut ke slide berikutnya. Itu tanda teksnya aman dan tidak memancing pertanyaan teknis yang tidak perlu.
-
